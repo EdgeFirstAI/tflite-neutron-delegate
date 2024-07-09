@@ -50,7 +50,13 @@ link_directories(${DELEGATE_SRC_DIR})
 
 add_library(neutron_delegate SHARED ${NEUTRON_DELEGATE_SRCS})
 
-list(APPEND NEUTRON_DELEGATE_DEPENDENCIES NeutronConverter NeutronDriver)
+if(NOT DEFINED NEUTRON_DRIVER_PATH)
+  list(APPEND NEUTRON_DELEGATE_DEPENDENCIES NeutronConverter NeutronDriver)
+else()
+  include_directories(${NEUTRON_DRIVER_PATH}/include)
+  list(APPEND NEUTRON_DELEGATE_DEPENDENCIES ${NEUTRON_DRIVER_PATH}/library/libNeutronDriver.so)
+  list(APPEND NEUTRON_DELEGATE_DEPENDENCIES ${NEUTRON_DRIVER_PATH}/library/libNeutronConverter.so)
+endif()
 
 target_compile_options(neutron_delegate PUBLIC ${NEUTRON_DELEGATE_OPTIONS})
 target_link_libraries(neutron_delegate PUBLIC ${NEUTRON_DELEGATE_DEPENDENCIES})
