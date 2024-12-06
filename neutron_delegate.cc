@@ -87,8 +87,10 @@ class NeutronDelegateKernel : public SimpleDelegateKernelInterface {
     delegate_op.builtin_code = BuiltinOperator_CUSTOM;
 
     char *s = getenv("NEUTRON_ENABLE_ZERO_COPY");
-    if (s)
-        enableZerocp = true;
+    if (s) {
+        int val = atoi(s);
+        enableZerocp = val == 0 ? false : true;
+    }
 
     return kTfLiteOk;
   }
@@ -430,7 +432,7 @@ class NeutronDelegateKernel : public SimpleDelegateKernelInterface {
   std::unique_ptr<ModelT> model;
 
   int slice_input;
-  bool enableZerocp = false;
+  bool enableZerocp = true;
 
   vector<OperationDataType> operations;
   NeutronDelegateOptions options;
