@@ -84,6 +84,7 @@ class NeutronDelegateKernel : public SimpleDelegateKernelInterface {
       delegate_op.outputs.push_back(node->outputs->data[index]);
       delegate_op.outputs_size.push_back(tensor->bytes);
     }
+    delegate_op.firmware_input = node->inputs->data[node->inputs->size - 1];
     delegate_op.builtin_code = BuiltinOperator_CUSTOM;
 
     char *s = getenv("NEUTRON_ENABLE_ZERO_COPY");
@@ -263,10 +264,14 @@ class NeutronDelegateKernel : public SimpleDelegateKernelInterface {
   TfLiteStatus Prepare(TfLiteContext* context, TfLiteNode* node) override {
     for (auto& op : operations) {
       if (op.builtin_code == BuiltinOperator_CUSTOM) {
+        if (op.isOpPrepared) {
+            continue;
+        }
         // Allocate arrays for inputs and outputs
         op.dcfg.inputs = new const void*[op.inputs.size()];
         op.dcfg.outputs = new void*[op.outputs.size()];
 
+        op.isOpPrepared = true;
 	if (options.model_type !=NeutronModelType_FFIRMWARE) {
           // Prepare data for through neutron driver.
           auto neutronRC = neutronModelPrepare(&op.mcfg, &op.nmh);
@@ -275,13 +280,7 @@ class NeutronDelegateKernel : public SimpleDelegateKernelInterface {
           Subgraph* this_subgraph = reinterpret_cast<Subgraph*>(context->impl_);
           size_t input_size, output_size;
 
-          TfLiteTensor* firmware_tensor = NULL;
-          for (int i = 0; i < context->tensors_size; i ++){
-              auto tensor = &context->tensors[i];
-              if (strcmp(tensor->name, "NeutronFirmware") == 0) {
-                  firmware_tensor = tensor;
-              }
-          }
+          TfLiteTensor* firmware_tensor = &context->tensors[op.firmware_input];
           TF_LITE_ENSURE(context, strcmp(firmware_tensor->name, "NeutronFirmware") == 0);
           auto neutronRC = neutronCustomPrepare((int32_t*)op.inputs_size.data(), op.inputs.size(),
                                                 (int32_t*)op.outputs_size.data(), op.outputs.size(),
@@ -428,6 +427,8 @@ class NeutronDelegateKernel : public SimpleDelegateKernelInterface {
       PadParams pad;
     } params;
     BuiltinOperator builtin_code;
+    int firmware_input;
+    bool isOpPrepared = false;
   };
   std::unique_ptr<ModelT> model;
 
