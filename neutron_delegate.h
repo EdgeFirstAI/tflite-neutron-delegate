@@ -24,6 +24,10 @@
 
 #include "tensorflow/lite/c/common.h"
 
+#define NEUTRON_TARGET "imx95"
+#define NEUTRON_CUSTOM_NAME "NeutronGraph"
+#define NEUTRON_FIRMWARE_NODE "NeutronOp"
+
 enum NeutronModelType{
   NeutronModelType_NORMAL = 0,
   NeutronModelType_CONVERTOR,

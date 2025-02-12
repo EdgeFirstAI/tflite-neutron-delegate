@@ -40,7 +40,6 @@ list(APPEND NEUTRON_DELEGATE_SRCS
   ${tensorflow_SOURCE_DIR}/tensorflow/lite/delegates/utils/simple_delegate.cc
   ${DELEGATE_SRC_DIR}/neutron_delegate.cc
   ${DELEGATE_SRC_DIR}/neutron_delegate_adaptor.cc
-  ${DELEGATE_SRC_DIR}/neutron_delegate_utils.cc
 )
 
 include_directories(${CMAKE_BINARY_DIR}/flatbuffers/include)
@@ -51,11 +50,10 @@ link_directories(${DELEGATE_SRC_DIR})
 add_library(neutron_delegate SHARED ${NEUTRON_DELEGATE_SRCS})
 
 if(NOT DEFINED NEUTRON_DRIVER_PATH)
-  list(APPEND NEUTRON_DELEGATE_DEPENDENCIES NeutronConverter NeutronDriver)
+  list(APPEND NEUTRON_DELEGATE_DEPENDENCIES NeutronDriver)
 else()
   include_directories(${NEUTRON_DRIVER_PATH}/include)
   list(APPEND NEUTRON_DELEGATE_DEPENDENCIES ${NEUTRON_DRIVER_PATH}/library/libNeutronDriver.so)
-  list(APPEND NEUTRON_DELEGATE_DEPENDENCIES ${NEUTRON_DRIVER_PATH}/library/libNeutronConverter.so)
 endif()
 
 target_compile_options(neutron_delegate PUBLIC ${NEUTRON_DELEGATE_OPTIONS})
