@@ -175,8 +175,8 @@ class NeutronDelegateKernel : public SimpleDelegateKernelInterface {
 
         TfLiteTensor* firmware_tensor = &context->tensors[op.firmware_input];
         TF_LITE_ENSURE(context, strcmp(firmware_tensor->name, "NeutronFirmware") == 0);
-        auto neutronRC = neutronCustomPrepare((int32_t*)op.inputs_size.data(), op.inputs.size(),
-                                              (int32_t*)op.outputs_size.data(), op.outputs.size(),
+        auto neutronRC = neutronCustomPrepare((uint32_t*)op.inputs_size.data(), op.inputs.size(),
+                                              (uint32_t*)op.outputs_size.data(), op.outputs.size(),
                                               firmware_tensor->data.data, firmware_tensor->bytes, &op.nmh);
         TF_LITE_ENSURE_EQ(context, neutronRC, ENONE);
         if (enableZerocp) {
