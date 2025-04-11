@@ -42,6 +42,22 @@ list(APPEND NEUTRON_DELEGATE_SRCS
   ${DELEGATE_SRC_DIR}/neutron_delegate_adaptor.cc
 )
 
+execute_process(
+    COMMAND git rev-parse --short=8 HEAD
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    OUTPUT_VARIABLE GIT_COMMIT_HASH
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+)
+
+if(GIT_COMMIT_HASH)
+    message(STATUS "Current git commit hash (short): ${GIT_COMMIT_HASH}")
+else()
+    message(WARNING "Failed to retrieve git commit hash. Not a Git repository?")
+    set(GIT_COMMIT_HASH "unknown")
+endif()
+add_definitions(-DGIT_COMMIT_HASH="${GIT_COMMIT_HASH}")
+
 include_directories(${CMAKE_BINARY_DIR}/flatbuffers/include)
 include_directories("${tensorflow_SOURCE_DIR}")
 include_directories("${DELEGATE_SRC_DIR}/include")

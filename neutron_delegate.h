@@ -24,6 +24,7 @@
 
 #include "tensorflow/lite/c/common.h"
 
+#define NEUTRON_DELEGATE_VERSION "1.0.0"
 #define NEUTRON_TARGET "imx95"
 #define NEUTRON_CUSTOM_NAME "NeutronGraph"
 #define NEUTRON_FIRMWARE_NODE "NeutronOp"
