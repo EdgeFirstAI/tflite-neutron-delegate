@@ -1,5 +1,5 @@
 #
-# Copyright 2023-2024 NXP
+# Copyright 2023-2025 NXP
 #
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -26,6 +26,7 @@ set(CMAKE_MODULE_PATH
   "${CMAKE_CURRENT_LIST_DIR}/cmake/modules"
   ${CMAKE_MODULE_PATH}
 )
+option(BUILD_FOR_LITERT "Configure neutron delegate build for LiteRT" OFF)
 
 # Build in debug mode by default
 if (NOT CMAKE_BUILD_TYPE STREQUAL Release)
@@ -34,10 +35,21 @@ endif()
 
 set(DELEGATE_SRC_DIR        ${CMAKE_CURRENT_SOURCE_DIR})
 
-
+if(${BUILD_FOR_LITERT})
+  set(TFLITE_GIT_REPOSITORY "https://github.com/nxp-imx/litert-imx")
+  set(TFLITE_GIT_TAG "lf-6.12.20_2.0.0")
+  set(NEUTRON_DELEGATE_TARGET "litert_neutron_delegate")
+  set(TFLITE_SUB_PATH "tflite")
+  list(APPEND NEUTRON_DELEGATE_OPTIONS "-DBUILD_FOR_LITERT")
+else()
+  set(TFLITE_GIT_REPOSITORY "https://github.com/nxp-imx/tensorflow-imx")
+  set(TFLITE_GIT_TAG "lf-6.12.20_2.0.0")
+  set(NEUTRON_DELEGATE_TARGET "neutron_delegate")
+  set(TFLITE_SUB_PATH "tensorflow/lite")
+endif()
 find_package(tensorflow REQUIRED)
 list(APPEND NEUTRON_DELEGATE_SRCS
-  ${tensorflow_SOURCE_DIR}/tensorflow/lite/delegates/utils/simple_delegate.cc
+  ${tensorflow_SOURCE_DIR}/${TFLITE_SUB_PATH}/delegates/utils/simple_delegate.cc
   ${DELEGATE_SRC_DIR}/neutron_delegate.cc
   ${DELEGATE_SRC_DIR}/neutron_delegate_adaptor.cc
 )
@@ -58,20 +70,19 @@ else()
 endif()
 add_definitions(-DGIT_COMMIT_HASH="${GIT_COMMIT_HASH}")
 
-include_directories(${CMAKE_BINARY_DIR}/flatbuffers/include)
-include_directories("${tensorflow_SOURCE_DIR}")
-include_directories("${DELEGATE_SRC_DIR}/include")
-link_directories(${DELEGATE_SRC_DIR})
-
-add_library(neutron_delegate SHARED ${NEUTRON_DELEGATE_SRCS})
+add_library(${NEUTRON_DELEGATE_TARGET} SHARED ${NEUTRON_DELEGATE_SRCS})
+target_include_directories(${NEUTRON_DELEGATE_TARGET}
+    PUBLIC
+    $<TARGET_PROPERTY:TensorFlow::tensorflow-lite,INCLUDE_DIRECTORIES>
+)
 
 if(NOT DEFINED NEUTRON_DRIVER_PATH)
   list(APPEND NEUTRON_DELEGATE_DEPENDENCIES NeutronDriver)
 else()
-  target_link_options(neutron_delegate PRIVATE "-Wl,-z,max-page-size=16384")
+  target_link_options(${NEUTRON_DELEGATE_TARGET} PRIVATE "-Wl,-z,max-page-size=16384")
   include_directories(${NEUTRON_DRIVER_PATH}/include)
   list(APPEND NEUTRON_DELEGATE_DEPENDENCIES ${NEUTRON_DRIVER_PATH}/library/libNeutronDriver.so)
 endif()
 
-target_compile_options(neutron_delegate PUBLIC ${NEUTRON_DELEGATE_OPTIONS})
-target_link_libraries(neutron_delegate PUBLIC ${NEUTRON_DELEGATE_DEPENDENCIES})
+target_compile_options(${NEUTRON_DELEGATE_TARGET} PUBLIC ${NEUTRON_DELEGATE_OPTIONS})
+target_link_libraries(${NEUTRON_DELEGATE_TARGET} PUBLIC ${NEUTRON_DELEGATE_DEPENDENCIES})
