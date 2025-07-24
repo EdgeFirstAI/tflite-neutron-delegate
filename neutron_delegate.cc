@@ -88,31 +88,30 @@ class NeutronDelegateKernel : public SimpleDelegateKernelInterface {
 
   TfLiteStatus InitFineTuningModel(TfLiteContext* context,
                     const TfLiteDelegateParams* params) {
-    TF_LITE_ENSURE_EQ(context, params->nodes_to_replace->size, 1);
-    operations.resize(1);
-
-    auto &delegate_op = operations[0];
-    // Get this node information.
-    const int node_index = params->nodes_to_replace->data[0];
-    TfLiteNode* node = nullptr;
-    TfLiteRegistration* node_registration = nullptr;
-    TF_LITE_ENSURE_EQ(
-        context,
-        context->GetNodeAndRegistration(context, node_index, &node,
-                                        &node_registration),
-        kTfLiteOk);
-    for (int index = 0; index < node->inputs->size - 1; index ++) {
-      auto tensor = &context->tensors[node->inputs->data[index]];
-      delegate_op.inputs.push_back(node->inputs->data[index]);
-      delegate_op.inputs_size.push_back(tensor->bytes);
+    operations.resize(params->nodes_to_replace->size);
+    for (int i = 0; i < params->nodes_to_replace->size; ++i) {
+      auto &delegate_op = operations[i];
+      // Get this node information.
+      const int node_index = params->nodes_to_replace->data[0];
+      TfLiteNode* node = nullptr;
+      TfLiteRegistration* node_registration = nullptr;
+      TF_LITE_ENSURE_EQ(
+          context,
+          context->GetNodeAndRegistration(context, node_index, &node,
+                                          &node_registration),
+          kTfLiteOk);
+      for (int index = 0; index < node->inputs->size - 1; index ++) {
+        auto tensor = &context->tensors[node->inputs->data[index]];
+        delegate_op.inputs.push_back(node->inputs->data[index]);
+        delegate_op.inputs_size.push_back(tensor->bytes);
+      }
+      for (int index = 0; index < node->outputs->size; index ++) {
+        auto tensor = &context->tensors[node->outputs->data[index]];
+        delegate_op.outputs.push_back(node->outputs->data[index]);
+        delegate_op.outputs_size.push_back(tensor->bytes);
+      }
+      delegate_op.firmware_input = node->inputs->data[node->inputs->size - 1];
     }
-    for (int index = 0; index < node->outputs->size; index ++) {
-      auto tensor = &context->tensors[node->outputs->data[index]];
-      delegate_op.outputs.push_back(node->outputs->data[index]);
-      delegate_op.outputs_size.push_back(tensor->bytes);
-    }
-    delegate_op.firmware_input = node->inputs->data[node->inputs->size - 1];
-
     return kTfLiteOk;
   }
 
