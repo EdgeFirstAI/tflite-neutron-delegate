@@ -38,6 +38,7 @@ enum NeutronModelType{
 typedef struct {
   std::string target;
   NeutronModelType model_type;
+  std::vector<int> shared_tensors; //tensors shared between Neutron nodes
 }NeutronDelegateOptions;
 
 // Returns a structure with the default delegate options.

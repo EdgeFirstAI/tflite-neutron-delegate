@@ -22,6 +22,7 @@
 #include <map>
 #include <iostream>
 #include <fcntl.h>
+#include <unordered_set>
 
 
 #include "neutron_delegate.h"
@@ -203,12 +204,8 @@ class NeutronDelegateKernel : public SimpleDelegateKernelInterface {
         for (int index = 0; index < input_size; index ++) {
           auto tensor_index = op.inputs[index];
           auto tensor = &context->tensors[tensor_index];
-          // Skip if customAllocation have been set.
-          if (tensor->allocation_type == kTfLiteCustom) {
-            op.dcfg.inputs[index] = (const void *)(tensor->data.raw);
-            continue;
-          }
-          TfLiteCustomAllocation allocation= {(void*)op.dcfg.inputs[index], tensor->bytes};
+
+          TfLiteCustomAllocation allocation = {(void*)op.dcfg.inputs[index], tensor->bytes};
           this_subgraph->SetCustomAllocationForTensor(tensor_index, allocation, kTfLiteCustomAllocationFlagsSkipAlignCheck);
         }
 
@@ -216,12 +213,8 @@ class NeutronDelegateKernel : public SimpleDelegateKernelInterface {
         for (int index = 0; index < output_size; index ++) {
           auto tensor_index = op.outputs[index];
           auto tensor = &context->tensors[tensor_index];
-          // Skip if customAllocation have been set.
-          if (tensor->allocation_type == kTfLiteCustom) {
-            op.dcfg.outputs[index] = (void *)(tensor->data.raw);
-            continue;
-          }
-          TfLiteCustomAllocation allocation= {(void*)op.dcfg.outputs[index], tensor->bytes};
+
+          TfLiteCustomAllocation allocation = {(void*)op.dcfg.outputs[index], tensor->bytes};
           this_subgraph->SetCustomAllocationForTensor(tensor_index, allocation, kTfLiteCustomAllocationFlagsSkipAlignCheck);
         }
       }
@@ -232,8 +225,6 @@ class NeutronDelegateKernel : public SimpleDelegateKernelInterface {
 
   TfLiteStatus Eval(TfLiteContext* context, TfLiteNode* node) override {
     for (auto &delegate_op : operations) {
-      auto input = &context->tensors[delegate_op.inputs[0]];
-      auto output = &context->tensors[delegate_op.outputs[0]];
       if (!enableZerocp) {
         // Set reference for all inputs
         for (int index = 0; index < delegate_op.inputs.size(); index ++) {
@@ -256,6 +247,19 @@ class NeutronDelegateKernel : public SimpleDelegateKernelInterface {
       } else {
         auto neutronRC = neutronCustomExec(delegate_op.nmh, &delegate_op.dcfg);
         TF_LITE_ENSURE_EQ(context, neutronRC, ENONE);
+      }
+
+      // When tensor is shared between two connected neutron buffers, copy it from neutron buffer to tensor->data.raw
+      // The next op can use the tensor->data.raw find the correct result
+      if (enableZerocp) {
+        for (int index = 0; index < delegate_op.outputs.size(); index ++) {
+          auto tensor_index = delegate_op.outputs[index];
+          auto tensor = &context->tensors[tensor_index];
+          auto& v = options.shared_tensors;
+          if (std::find(v.begin(), v.end(), tensor_index) != v.end()) {
+            memcpy((void *)tensor->data.raw, (void *)delegate_op.dcfg.outputs[index], tensor->bytes);
+          }
+        }
       }
     }
     return kTfLiteOk;
@@ -323,10 +327,73 @@ class NeutronDelegate : public SimpleDelegateInterface {
     return ret;
   }
 
+  // Analyzes shared tensors in the entire model.
+  // A tensor is "shared" if it is an output of an NPU node and input to another NPU node.
+  TfLiteStatus NeutronFindSharedTensors(TfLiteContext* context) {
+    // Step 1: Precompute consumer nodes for each tensor
+    // tensor_consumers[tensor_idx] = set of NPU nodes consuming tensor_idx
+    std::vector<std::unordered_set<int>> tensor_consumers(context->tensors_size);
+
+    TfLiteIntArray* execution_plan;
+    context->GetExecutionPlan(context, &execution_plan);
+
+    for (int node_idx=0; node_idx < execution_plan->size; node_idx++) {
+        TfLiteNode* node;
+        TfLiteRegistration* reg;
+        if (context->GetNodeAndRegistration(context, node_idx, &node, &reg) != kTfLiteOk)
+            continue;
+
+        bool is_npu_node = (reg->custom_name != nullptr &&
+                            std::strstr(reg->custom_name, NEUTRON_CUSTOM_NAME) != nullptr);
+        if (!is_npu_node) continue;
+
+        // Record all input tensors consumed by this NPU node
+        for (int i = 0; i < node->inputs->size; ++i) {
+            int tensor_idx = node->inputs->data[i];
+            if (tensor_idx >= 0) {
+                tensor_consumers[tensor_idx].insert(node_idx);
+            }
+        }
+    }
+
+    // Step 2: Identify shared tensors
+    for (int tensor_idx = 0; tensor_idx < context->tensors_size; ++tensor_idx) {
+        // Check if tensor is produced by an NPU node
+        bool produced_by_npu = false;
+        for (int node_idx = 0; node_idx < execution_plan->size; ++node_idx) {
+            TfLiteNode* node;
+            TfLiteRegistration* reg;
+            context->GetNodeAndRegistration(context, node_idx, &node, &reg);
+            bool is_npu_producer = (reg->custom_name != nullptr && 
+                                   std::strstr(reg->custom_name, NEUTRON_CUSTOM_NAME) != nullptr);
+
+            // Check if current NPU node outputs the tensor
+            for (int j = 0; j < node->outputs->size; ++j) {
+                if (node->outputs->data[j] == tensor_idx && is_npu_producer) {
+                    produced_by_npu = true;
+                    break;
+                }
+            }
+            if (produced_by_npu) break;
+        }
+
+        // Shared condition: NPU-produced AND consumed by ≥1 NPU node
+        if (produced_by_npu && !tensor_consumers[tensor_idx].empty()) {
+            options_.shared_tensors.push_back(tensor_idx);
+        }
+    }
+
+    return kTfLiteOk;
+}
+
   TfLiteStatus Initialize(TfLiteContext* context) override {
     // Initialize the neutron driver library
     NeutronError err = neutronInit();
     TF_LITE_ENSURE_EQ(context, err, ENONE);
+
+    // Try to find the shared tensors between two neutron nodes
+    // Cannot run in NeutronKernelDelegate::init due to the execution plan is different.
+    NeutronFindSharedTensors(context);
 
     TfLiteIntArray* plan;
     TfLiteNode* node;
