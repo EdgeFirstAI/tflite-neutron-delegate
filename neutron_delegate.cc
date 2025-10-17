@@ -198,7 +198,7 @@ class NeutronDelegateKernel : public SimpleDelegateKernelInterface {
          */
         if (options.model_type == NeutronModelType_CONVERTOR) {
           input_size -= 3;
-          output_size -= 1;
+          output_size -= 3; // leave space for profiling and debug tensor
         }
         // Alloc for input tensor
         for (int index = 0; index < input_size; index ++) {
