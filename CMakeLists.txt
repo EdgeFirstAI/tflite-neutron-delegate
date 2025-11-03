@@ -70,7 +70,6 @@ else()
 endif()
 add_definitions(-DGIT_COMMIT_HASH="${GIT_COMMIT_HASH}")
 
-link_directories(${DELEGATE_SRC_DIR})
 add_library(${NEUTRON_DELEGATE_TARGET} SHARED ${NEUTRON_DELEGATE_SRCS})
 target_include_directories(${NEUTRON_DELEGATE_TARGET}
     PUBLIC
