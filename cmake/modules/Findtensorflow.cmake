@@ -5,12 +5,22 @@
 #
 
 include(FetchContent)
-FetchContent_Declare(
-  tensorflow
-  GIT_REPOSITORY ${TFLITE_GIT_REPOSITORY}
-  GIT_TAG ${TFLITE_GIT_TAG}
-  GIT_SHALLOW    TRUE
-)
+
+if (NOT NEUTRON_INTEGRATION)
+  FetchContent_Declare(
+    tensorflow
+    GIT_REPOSITORY ${TFLITE_GIT_REPOSITORY}
+    GIT_TAG ${TFLITE_GIT_TAG}
+    GIT_SHALLOW    TRUE
+  )
+else()
+  message(STATUS "Using LOCAL Tensorflow")
+  FetchContent_Declare(
+    tensorflow
+    SOURCE_DIR "${DELEGATE_SRC_DIR}/../tflite"
+  )
+  FetchContent_MakeAvailable(tensorflow)
+endif()
 
 FetchContent_GetProperties(tensorflow)
 if(NOT tensorflow_POPULATED)
