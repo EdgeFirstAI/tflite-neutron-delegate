@@ -183,6 +183,9 @@ class NeutronDelegateKernel : public SimpleDelegateKernelInterface {
                                               firmware_tensor->data.data, firmware_tensor->bytes, &op.nmh);
         TF_LITE_ENSURE_EQ(context, neutronRC, ENONE);
       }
+
+      op.mcfg.subgraphName = NULL;
+
       if (enableZerocp) {
         Subgraph* this_subgraph = reinterpret_cast<Subgraph*>(context->impl_);
         size_t input_size, output_size;
