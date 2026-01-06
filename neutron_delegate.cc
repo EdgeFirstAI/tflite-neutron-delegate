@@ -33,6 +33,7 @@
 #include "tensorflow/lite/kernels/internal/optimized/optimized_ops.h"
 #include "tensorflow/lite/delegates/utils/simple_delegate.h"
 #include "tensorflow/lite/core/subgraph.h"
+#include "flatbuffers/flexbuffers.h"
 
 extern "C" {
 #include "neutron/NeutronDriver.h"
@@ -87,6 +88,27 @@ class NeutronDelegateKernel : public SimpleDelegateKernelInterface {
     }
   }
 
+  char* NeutronGetAttribute(TfLiteNode* node, const char *key) {
+     if (node->custom_initial_data != nullptr && node->custom_initial_data_size > 0) {
+        const uint8_t* custom_data = reinterpret_cast<const uint8_t*>(node->custom_initial_data);
+        size_t custom_size = static_cast<size_t>(node->custom_initial_data_size);
+
+        // Parse FlexBuffer dictionary
+        auto root = flexbuffers::GetRoot(custom_data, custom_size);
+        if (root.IsMap()) {
+            auto map = root.AsMap();
+
+            if (map[key].IsString()) {
+                std::string subgraph_name = map[key].AsString().str();
+                char* persistent_name = new char[subgraph_name.length() + 1];
+                std::strcpy(persistent_name, subgraph_name.c_str());
+		return persistent_name;
+            }
+        }
+      }
+      return nullptr;
+  }
+
   TfLiteStatus InitFineTuningModel(TfLiteContext* context,
                     const TfLiteDelegateParams* params) {
     operations.resize(params->nodes_to_replace->size);
@@ -131,6 +153,9 @@ class NeutronDelegateKernel : public SimpleDelegateKernelInterface {
                                         &node_registration),
         kTfLiteOk);
 
+      // Get the subgraph name from attribute, like subgraph_030
+      delegate_op.mcfg.subgraphName = NeutronGetAttribute(node, "subgraph");
+
       for (int index = 0; index < node->inputs->size; index ++)
         delegate_op.inputs.push_back(node->inputs->data[index]);
       for (int index = 0; index < node->outputs->size; index ++)
@@ -160,6 +185,7 @@ class NeutronDelegateKernel : public SimpleDelegateKernelInterface {
     return kTfLiteOk;
   }
 
+
   TfLiteStatus Prepare(TfLiteContext* context, TfLiteNode* node) override {
     for (auto& op : operations) {
       if (op.isOpPrepared) {
@@ -183,8 +209,6 @@ class NeutronDelegateKernel : public SimpleDelegateKernelInterface {
                                               firmware_tensor->data.data, firmware_tensor->bytes, &op.nmh);
         TF_LITE_ENSURE_EQ(context, neutronRC, ENONE);
       }
-
-      op.mcfg.subgraphName = NULL;
 
       if (enableZerocp) {
         Subgraph* this_subgraph = reinterpret_cast<Subgraph*>(context->impl_);
@@ -329,6 +353,7 @@ class NeutronDelegate : public SimpleDelegateInterface {
     }
     return ret;
   }
+
 
   // Analyzes shared tensors in the entire model.
   // A tensor is "shared" if it is an output of an NPU node and input to another NPU node.
