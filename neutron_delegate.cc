@@ -26,6 +26,7 @@
 
 
 #include "neutron_delegate.h"
+#include "neutron_delegate_dmabuf.h"
 
 #include "tensorflow/lite/context_util.h"
 #include "tensorflow/lite/builtin_ops.h"
@@ -217,6 +218,22 @@ class NeutronDelegateKernel : public SimpleDelegateKernelInterface {
           TfLiteCustomAllocation allocation = {(void*)op.dcfg.outputs[index], tensor->bytes};
           this_subgraph->SetCustomAllocationForTensor(tensor_index, allocation, kTfLiteCustomAllocationFlagsSkipAlignCheck);
         }
+
+        // Discover DMA-BUF fds for tensor buffers (hal_dmabuf_* API)
+        vector<DmabufTensorVaddr> tensor_vaddrs;
+        for (int index = 0; index < input_size; index++) {
+          auto tensor_index = op.inputs[index];
+          tensor_vaddrs.push_back({tensor_index,
+                                   (uintptr_t)op.dcfg.inputs[index],
+                                   (size_t)context->tensors[tensor_index].bytes});
+        }
+        for (int index = 0; index < output_size; index++) {
+          auto tensor_index = op.outputs[index];
+          tensor_vaddrs.push_back({tensor_index,
+                                   (uintptr_t)op.dcfg.outputs[index],
+                                   (size_t)context->tensors[tensor_index].bytes});
+        }
+        dmabuf_discover(tensor_vaddrs);
       }
     }
     return kTfLiteOk;
@@ -455,11 +472,14 @@ NeutronDelegateOptions NeutronDelegateOptionsDefault() {
 TfLiteDelegate* NeutronDelegateCreate(const NeutronDelegateOptions* options) {
   auto delegate = make_unique<tflite::neutron::NeutronDelegate>(
           options ? *options : NeutronDelegateOptionsDefault());
-  return tflite::TfLiteDelegateFactory::CreateSimpleDelegate(move(delegate), 
+  auto* raw = tflite::TfLiteDelegateFactory::CreateSimpleDelegate(move(delegate),
              kTfLiteDelegateFlagsAllowDynamicTensors);
+  dmabuf_set_delegate(raw);
+  return raw;
 }
 
 // Destroys a delegate created with `NeutronDelegateCreate` call.
 void NeutronDelegateDelete(TfLiteDelegate* delegate) {
   tflite::TfLiteDelegateFactory::DeleteSimpleDelegate(delegate);
+  dmabuf_clear();
 }
