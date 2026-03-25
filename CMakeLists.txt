@@ -52,6 +52,7 @@ list(APPEND NEUTRON_DELEGATE_SRCS
   ${tensorflow_SOURCE_DIR}/${TFLITE_SUB_PATH}/delegates/utils/simple_delegate.cc
   ${DELEGATE_SRC_DIR}/neutron_delegate.cc
   ${DELEGATE_SRC_DIR}/neutron_delegate_adaptor.cc
+  ${DELEGATE_SRC_DIR}/neutron_delegate_dmabuf.cc
 )
 
 execute_process(
