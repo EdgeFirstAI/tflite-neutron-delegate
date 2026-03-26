@@ -17,7 +17,7 @@
  */
 
 #include "neutron_delegate_dmabuf.h"
-#include "hal_dmabuf.h"
+#include <edgefirst/hal.h>
 
 #include <dirent.h>
 #include <errno.h>
@@ -329,7 +329,11 @@ int hal_dmabuf_get_tensor_info(TfLiteDelegate *delegate,
     if (!entry)
         return -1;
 
-    struct hal_dmabuf_tensor_info local = {entry->fd, entry->offset, entry->size};
+    memset(info, 0, info_size);
+    hal_dmabuf_tensor_info local = {};
+    local.fd = entry->fd;
+    local.offset = entry->offset;
+    local.size = entry->size;
     size_t copy_size = info_size < sizeof(local) ? info_size : sizeof(local);
     memcpy(info, &local, copy_size);
     return 0;
