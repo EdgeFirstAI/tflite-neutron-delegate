@@ -17,10 +17,10 @@
  */
 
 #include "neutron_delegate_dmabuf.h"
-#include <edgefirst/hal.h>
+#include "hal_dmabuf.h"
 
 #include <dirent.h>
-#include <errno.h>
+#include <cerrno>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -293,7 +293,7 @@ static const DmabufTensorEntry *dmabuf_lookup(TfLiteDelegate *delegate,
     }
     auto it = g_dmabuf.tensors.find(tensor_index);
     if (it == g_dmabuf.tensors.end()) {
-        errno = ENOENT;
+        errno = ERANGE;
         return nullptr;
     }
     return &it->second;
@@ -302,48 +302,55 @@ static const DmabufTensorEntry *dmabuf_lookup(TfLiteDelegate *delegate,
 extern "C" {
 
 __attribute__((visibility("default")))
-bool hal_dmabuf_is_supported(TfLiteDelegate *delegate)
+hal_delegate_t hal_dmabuf_get_instance(void)
 {
-    return g_dmabuf.delegate != nullptr &&
-           g_dmabuf.delegate == delegate &&
-           g_dmabuf.discovered;
+    return static_cast<hal_delegate_t>(g_dmabuf.delegate);
 }
 
 __attribute__((visibility("default")))
-TfLiteDelegate *hal_dmabuf_get_instance(void)
+int hal_dmabuf_is_supported(hal_delegate_t delegate)
 {
-    return g_dmabuf.delegate;
+    TfLiteDelegate *d = static_cast<TfLiteDelegate *>(delegate);
+    return (g_dmabuf.delegate != nullptr &&
+            g_dmabuf.delegate == d &&
+            g_dmabuf.discovered) ? 1 : 0;
 }
 
 __attribute__((visibility("default")))
-int hal_dmabuf_get_tensor_info(TfLiteDelegate *delegate,
+int hal_dmabuf_get_tensor_info(hal_delegate_t delegate,
                                int tensor_index,
-                               struct hal_dmabuf_tensor_info *info,
+                               hal_dmabuf_tensor_info *info,
                                size_t info_size)
 {
-    if (!info || info_size == 0) {
+    if (!info || info_size < sizeof(hal_dmabuf_tensor_info) || tensor_index < 0) {
         errno = EINVAL;
         return -1;
     }
-    const DmabufTensorEntry *entry = dmabuf_lookup(delegate, tensor_index);
+    TfLiteDelegate *d = static_cast<TfLiteDelegate *>(delegate);
+    const DmabufTensorEntry *entry = dmabuf_lookup(d, tensor_index);
     if (!entry)
         return -1;
 
     memset(info, 0, info_size);
-    hal_dmabuf_tensor_info local = {};
-    local.fd = entry->fd;
-    local.offset = entry->offset;
-    local.size = entry->size;
-    size_t copy_size = info_size < sizeof(local) ? info_size : sizeof(local);
-    memcpy(info, &local, copy_size);
+    info->fd = entry->fd;
+    info->offset = entry->offset;
+    info->size = entry->size;
+    /* Shape/dtype not available from DmabufTensorEntry; set ndim = 0 per spec */
+    info->ndim = 0;
+    info->dtype = HAL_DTYPE_U8;
     return 0;
 }
 
 __attribute__((visibility("default")))
-int hal_dmabuf_sync_for_device(TfLiteDelegate *delegate,
+int hal_dmabuf_sync_for_device(hal_delegate_t delegate,
                                int tensor_index)
 {
-    const DmabufTensorEntry *entry = dmabuf_lookup(delegate, tensor_index);
+    if (tensor_index < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    TfLiteDelegate *d = static_cast<TfLiteDelegate *>(delegate);
+    const DmabufTensorEntry *entry = dmabuf_lookup(d, tensor_index);
     if (!entry)
         return -1;
 
@@ -352,15 +359,44 @@ int hal_dmabuf_sync_for_device(TfLiteDelegate *delegate,
 }
 
 __attribute__((visibility("default")))
-int hal_dmabuf_sync_for_cpu(TfLiteDelegate *delegate,
+int hal_dmabuf_sync_for_cpu(hal_delegate_t delegate,
                             int tensor_index)
 {
-    const DmabufTensorEntry *entry = dmabuf_lookup(delegate, tensor_index);
+    if (tensor_index < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    TfLiteDelegate *d = static_cast<TfLiteDelegate *>(delegate);
+    const DmabufTensorEntry *entry = dmabuf_lookup(d, tensor_index);
     if (!entry)
         return -1;
 
     /* Invalidate CPU caches before reading device-written data */
     return dmabuf_sync(entry->fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ);
+}
+
+__attribute__((visibility("default")))
+int hal_camera_adaptor_is_supported(hal_delegate_t delegate,
+                                    const char *format)
+{
+    (void)delegate;
+    (void)format;
+    return 0;
+}
+
+__attribute__((visibility("default")))
+int hal_camera_adaptor_get_format_info(hal_delegate_t delegate,
+                                       const char *format,
+                                       hal_camera_adaptor_format_info *info,
+                                       size_t info_size)
+{
+    (void)delegate;
+    if (!format || !info || info_size == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    errno = ENOTSUP;
+    return -1;
 }
 
 }  /* extern "C" */
