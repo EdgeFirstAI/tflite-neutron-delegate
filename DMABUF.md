@@ -107,7 +107,7 @@ flowchart LR
     subgraph Consumer["Consumer (borrower)"]
         Query["hal_dmabuf_get_tensor_info()<br/>→ borrowed fd + offset + shape"]
         Use["hal_import_image(fd, offset)<br/>EGLImage import → GPU rendering"]
-        Sync["hal_dmabuf_sync_for_device()\nhal_dmabuf_sync_for_cpu()"]
+        Sync["hal_dmabuf_sync_for_device()<br/>hal_dmabuf_sync_for_cpu()"]
     end
 
     Alloc --> FD
