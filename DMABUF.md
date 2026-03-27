@@ -5,601 +5,521 @@
 | Field | Value |
 |-------|-------|
 | **Author** | Sébastien Taylor <sebastien@au-zone.com> |
-| **Version** | 0.1.0 |
-| **Date** | 2026-03-24 |
-| **Status** | Architecture Proposal |
+| **Version** | 0.2.0 |
+| **Date** | 2026-03-27 |
+| **Status** | Test Release |
 
 ### Changelog
 
 | Version | Date | Description |
 |---------|------|-------------|
+| 0.2.0 | 2026-03-27 | Updated to match working implementation; Mermaid diagrams; cross-references tflite-rs, nnstreamer, hal/ARCHITECTURE.md |
 | 0.1.0 | 2026-03-24 | Initial architecture and requirements |
 
 ---
 
 ## Overview
 
-This document describes the architecture for adding DMA-BUF zero-copy buffer sharing to the TFLite Neutron Delegate on NXP i.MX95. The goal is to enable GPU↔NPU buffer sharing so that OpenGL preprocessing (running on the Mali GPU) can render directly into NPU input buffers — eliminating CPU memcpy from the inference pipeline.
+This document describes the DMA-BUF zero-copy buffer sharing implementation for the TFLite Neutron Delegate on NXP i.MX 95. The feature enables GPU↔NPU zero-copy by allowing the GPU preprocessing pipeline (OpenGL fragment shaders on the ARM Mali Valhall GPU) to render directly into NPU input buffers, eliminating CPU memcpy from the inference pipeline.
 
-### Target Use Case
+The VX Delegate for NXP i.MX 8M Plus implements the same `hal_dmabuf_*` ABI and is documented separately: [`github.com/EdgeFirstAI/tflite-vx-delegate-imx`](https://github.com/EdgeFirstAI/tflite-vx-delegate-imx).
 
-The EdgeFirst AI pipeline performs image preprocessing on the GPU via OpenGL fragment shaders:
+### Target Pipeline
 
+```mermaid
+sequenceDiagram
+    participant V4L2 as Camera V4L2
+    participant GPU as Mali Valhall GPU
+    participant NPU as Neutron NPU
+    participant App as Application
+
+    App->>NPU: AllocateTensors() + NEUTRON_ENABLE_ZERO_COPY=1
+    App->>App: hal_dmabuf_get_instance() + hal_dmabuf_get_tensor_info(input_idx)
+    Note over App: info.fd, info.offset available
+
+    loop Per frame
+        V4L2-->>GPU: camera dmabuf fd (EGLImage import)
+        App->>GPU: hal_import_image(proc, npu_input_fd, offset)
+        App->>GPU: hal_image_processor_convert(camera→npu_input)
+        Note over GPU: resize + colorspace convert
+        GPU->>GPU: glFinish()
+        App->>App: hal_dmabuf_sync_for_device(delegate, input_idx)
+        App->>NPU: Invoke()
+        NPU-->>App: inference complete
+        App->>App: hal_dmabuf_sync_for_cpu(delegate, output_idx) [optional]
+    end
 ```
-Camera V4L2 dmabuf fd
-  → EGLImage import (Mali GPU)
-  → GL texture (sample from)
-  → Fragment shader (resize, normalize, color convert)
-  → Render into NPU input buffer (dmabuf fd from Neutron delegate)
-  → glFinish()
-  → neutronRunBlocking() — NPU reads preprocessed data, zero memcpy
-  → Output tensor dmabuf fds available for downstream
-```
-
-Today this pipeline works on i.MX 8M Plus with the VX Delegate. This document defines how to bring equivalent support to i.MX95 with the Neutron Delegate.
-
-### Why It Doesn't Exist Today
-
-The Neutron kernel driver allocates DMA buffers as anonymous inodes (`anon_inode_getfd`), not proper dmabufs. The Mali GPU cannot import anonymous inodes — it requires `dma_buf_export()`-created file descriptors with standard `dma_buf_ops`. Additionally, the proprietary userspace library (`libNeutronDriver.so`) hides the buffer file descriptors from the delegate, providing only mmap'd virtual pointers.
-
-### What We Proved (Prototype Findings)
-
-A prototype investigation on the imx95-evk confirmed:
-
-1. **The NPU operates on a single contiguous DMA buffer.** All tensors (inputs, outputs, weights, microcode, scratch) are packed at offsets within one buffer allocated via `NEUTRON_IOCTL_BUFFER_CREATE`. The NPU firmware receives offsets from a base DMA address written to hardware registers (`BASEDDRL`, `BASEINOUTL`, `BASESPILLL`).
-
-2. **External dma_heap buffers are invisible to the NPU.** Buffers allocated from `/dev/dma_heap/linux,cma` are not mapped in the NPU's SMMU (iommu group 9 at `490d0000.iommu`). The NPU writes zeros to these buffers — confirmed by on-target testing.
-
-3. **The kernel driver's DMA memory IS compatible with Mali GPU.** The driver uses `dma_alloc_attrs(dev, size, &dma_addr, GFP_KERNEL, DMA_ATTR_FORCE_CONTIGUOUS)` which allocates from the system CMA pool (960 MB on imx95-evk). The Mali Valhall GPU (`4d900000.gpu`) supports `EGL_EXT_image_dma_buf_import` and manages its own MMU page tables — it can map any CMA physical pages.
-
-4. **The kernel driver already creates fds.** `neutron_buffer_create()` calls `anon_inode_getfd("neutron-buffer", ...)` and returns the fd to userspace. The userspace library mmaps it and discards the fd. Converting this to `dma_buf_export()` makes the existing fd a proper dmabuf — no changes to the userspace library required.
-
-5. **Performance is equivalent.** Benchmark on YOLOv8n 640×640: non-zero-copy 36.4 ms, driver zero-copy 35.8 ms, dma_heap zero-copy 36.8 ms (though dma_heap outputs were zeros due to SMMU, the NPU execution path itself ran at full speed).
 
 ---
 
 ## Architecture
 
-### Driver Stack
+### System Overview
 
-```
-┌─────────────────────────────────────────────────────┐
-│ TFLite Neutron Delegate (neutron_delegate.cc)        │
-│   + new: neutron_delegate_dmabuf.cc                  │
-│   Exports: hal_dmabuf_* symbols                      │
-├─────────────────────────────────────────────────────┤
-│ libNeutronDriver.so (NXP proprietary binary)         │
-│   neutronDataSetup() → mmap'd pointers               │
-│   Buffer fds held internally                         │
-│   *** NO CHANGES REQUIRED ***                        │
-├─────────────────────────────────────────────────────┤
-│ /dev/neutron0 kernel driver (GPL, drivers/staging/)  │
-│   neutron_buffer_create() → dma_buf_export() fd      │
-│   SMMU-mapped via dma_alloc_attrs()                  │
-│   *** PATCH: anon_inode → dma_buf_export ***         │
-├─────────────────────────────────────────────────────┤
-│ Neutron NPU Hardware (behind SMMU at 490d0000)       │
-│   Reads/writes via DMA offsets from base_ddr         │
-└─────────────────────────────────────────────────────┘
-```
+```mermaid
+graph TB
+    subgraph "Consumer Layer"
+        NNS["NNStreamer<br/>(tensor_filter_tensorflow_lite.cc)"]
+        TFLRS["tflite-rs<br/>(edgefirst_tflite crate)"]
+        PYAPI["Python API<br/>(PyDmaBuf via PyO3)"]
+        CTEST["C / test_neutron_dmabuf.c"]
+    end
 
-### Buffer Sharing Flow
+    subgraph "HAL API Layer"
+        HALH["hal_dmabuf.h<br/>ABI contract (shipped per delegate)"]
+        EDGEH["edgefirst/hal.h<br/>shared type definitions"]
+        HALIMG["hal_image_processor<br/>hal_import_image / convert"]
+    end
 
-```
-┌──────────┐    ┌────────────┐    ┌──────────────┐    ┌──────────┐
-│  Camera  │    │  Mali GPU  │    │  Neutron NPU │    │ Display/ │
-│  V4L2    │    │  OpenGL ES │    │  Inference   │    │ Encoder  │
-└────┬─────┘    └─────┬──────┘    └──────┬───────┘    └────┬─────┘
-     │                │                   │                  │
-     │  dmabuf fd     │                   │                  │
-     ├───────────────►│                   │                  │
-     │                │  EGLImage import  │                  │
-     │                │  (camera input)   │                  │
-     │                │                   │                  │
-     │                │  hal_dmabuf_get_tensor_fd(input)     │
-     │                │◄──────────────────┤                  │
-     │                │  EGLImage import  │                  │
-     │                │  (NPU input buf)  │                  │
-     │                │                   │                  │
-     │                │  GL render:       │                  │
-     │                │  sample camera    │                  │
-     │                │  write to NPU buf │                  │
-     │                │                   │                  │
-     │                │  glFinish()       │                  │
-     │                ├──────────────────►│                  │
-     │                │                   │  NPU inference   │
-     │                │                   │  (reads input    │
-     │                │                   │   from dmabuf)   │
-     │                │                   │                  │
-     │                │                   │  hal_dmabuf_get_tensor_fd(output)
-     │                │                   ├─────────────────►│
-     │                │                   │  dmabuf fd       │
-     │                │                   │  (zero-copy out) │
+    subgraph "Delegate Layer"
+        ND["Neutron Delegate<br/>libneutron_delegate.so<br/>neutron_delegate_dmabuf.cc"]
+    end
+
+    subgraph "Kernel Layer"
+        NDK["Neutron kernel driver<br/>/dev/neutron0<br/>dma_buf_export() (patched)"]
+    end
+
+    NNS --> HALH
+    TFLRS --> HALH
+    PYAPI --> TFLRS
+    CTEST --> EDGEH
+
+    HALH --> ND
+    HALIMG --> HALH
+
+    ND --> NDK
+
+    style ND fill:#e8f5e9
+    style HALH fill:#e1f5ff
+    style EDGEH fill:#e1f5ff
 ```
 
-### What Changes Where
+### Buffer Ownership Model
 
-| Component | Repository | Change | Delivery |
-|-----------|-----------|--------|----------|
-| Kernel driver | `nxp-imx/linux-imx` | Patch `neutron_buffer.c`: `anon_inode_getfd` → `dma_buf_export` | `meta-edgefirst` bbappend |
-| Neutron delegate | `EdgeFirstAI/tflite-neutron-delegate` (fork) | Add `neutron_delegate_dmabuf.cc`, export `hal_dmabuf_*` symbols | Fork with feature branch |
-| edgefirst-tflite | `EdgeFirst/tflite-rs` | Update `try_load()` to probe `hal_dmabuf_*` symbols | Feature branch |
-| EdgeFirst HAL | `EdgeFirst/hal` | Formalize `hal_dmabuf_*` interface in C header | Feature branch |
-| VX delegate | `EdgeFirstAI/tflite-vx-delegate-imx` (fork) | Add `hal_dmabuf_*` symbol exports (thin wrappers around existing `VxDelegate*` functions) | Feature branch |
+The Neutron delegate uses a **delegate-owns-buffers** model: the delegate allocates the DMA-BUF memory and the consumer borrows the file descriptors. The consumer never allocates, registers, or releases buffers through the `hal_dmabuf_*` API.
+
+```mermaid
+flowchart LR
+    subgraph Delegate["Delegate (owner)"]
+        Alloc["allocates DMA-BUF<br/>on AllocateTensors()"]
+        FD["fd owned for delegate lifetime"]
+    end
+    subgraph Consumer["Consumer (borrower)"]
+        Query["hal_dmabuf_get_tensor_info()<br/>→ borrowed fd + offset + shape"]
+        Use["hal_import_image(fd, offset)<br/>EGLImage import → GPU rendering"]
+        Sync["hal_dmabuf_sync_for_device()\nhal_dmabuf_sync_for_cpu()"]
+    end
+
+    Alloc --> FD
+    FD -- "borrow (do not close)" --> Query
+    Query --> Use
+    Use --> Sync
+
+    style Delegate fill:#e8f5e9
+    style Consumer fill:#e1f5ff
+```
 
 ---
 
-## Kernel Driver Patch
+## Kernel Driver Patch (Neutron)
 
-### Current Code (`neutron_buffer.c:78-123`)
+### Background
 
-The existing `neutron_buffer_create()` allocates DMA memory and returns an anonymous inode fd:
+The Linux DMA-BUF framework ([`Documentation/driver-api/dma-buf.rst`](https://www.kernel.org/doc/html/latest/driver-api/dma-buf.html)) defines a standard mechanism for sharing hardware DMA buffers between devices. A **DMA-BUF** is a `struct dma_buf` backed by a file descriptor created via `dma_buf_export()`. Any device driver can attach to that fd via `dma_buf_attach()` + `dma_buf_map_attachment()` and obtain its own IOMMU mapping to the same physical memory — with no CPU copies.
 
-```c
-buf->cpu_addr = dma_alloc_attrs(buf->ndev->dev, size,
-                &buf->dma_addr, GFP_KERNEL, DMA_ATTR_FORCE_CONTIGUOUS);
+The Neutron kernel driver historically used `anon_inode_getfd()` for buffer file descriptors. Anonymous inodes are opaque kernel objects; the Mali GPU has no way to import them as DMA-BUFs. The patch converts the existing allocation to `dma_buf_export()`, making the fd a first-class DMA-BUF that:
 
-ret = anon_inode_getfd("neutron-buffer", &neutron_buffer_fops, buf,
-                       O_RDWR | O_CLOEXEC);
+- Mali imports via `EGL_EXT_image_dma_buf_import` (standard EGL extension)
+- V4L2 and DRM consumers can import via standard `dma_buf_attach()`
+- The kernel's `DMA_BUF_IOCTL_SYNC` ioctl works automatically for cache coherency
+- `libNeutronDriver.so` is unaffected — it only calls `mmap()` and `close()` on the fd, both of which work identically with DMA-BUF fds
+
+### Why the Existing Allocator Is Compatible
+
+The Neutron driver allocates buffers with `dma_alloc_attrs(dev, size, DMA_ATTR_FORCE_CONTIGUOUS)`. This forces allocation from the system CMA pool (960 MB on imx95-evk). The CMA physical pages are contiguous, so they can be described by a single-entry `sg_table` — the core requirement for the `dma_buf_ops.map_dma_buf` implementation.
+
+The Mali Valhall GPU manages its own MMU page tables independently of the SoC SMMU. It can map any CMA pages given a valid `sg_table` from `dma_buf_map_attachment()`. This is why GPU import works without changes to the Mali driver.
+
+### What the Patch Changes
+
+```mermaid
+flowchart TD
+    subgraph Before["Before (anon_inode)"]
+        B1["dma_alloc_attrs() → CMA buffer"]
+        B2["anon_inode_getfd('neutron-buffer')"]
+        B3["fd: opaque, only mmap/close work"]
+        B4["Mali GPU: cannot import ❌"]
+        B1 --> B2 --> B3 --> B4
+    end
+
+    subgraph After["After (dma_buf_export)"]
+        A1["dma_alloc_attrs() → CMA buffer (unchanged)"]
+        A2["dma_buf_export() with neutron_dmabuf_ops"]
+        A3["dma_buf_fd() → proper DMA-BUF fd"]
+        A4["Mali GPU: dma_buf_attach + EGLImage ✓"]
+        A5["DMA_BUF_IOCTL_SYNC: cache coherency ✓"]
+        A1 --> A2 --> A3 --> A4
+        A3 --> A5
+    end
+
+    style B4 fill:#ffcccb
+    style A4 fill:#90ee90
+    style A5 fill:#90ee90
 ```
 
-### Required Change
+The `struct dma_buf_ops` implementation provides:
 
-Replace the anonymous inode with a proper `dma_buf_export()`. **No changes to `libNeutronDriver.so` are required.** The proprietary userspace library only performs `mmap()` and `close()` on the buffer fd — both work identically with dma_buf fds.
+| Callback | Implementation |
+|----------|---------------|
+| `map_dma_buf` | Returns a single-entry `sg_table` from `dma_to_phys(buf->dma_addr)`. Calls `dma_map_sgtable()` on the **importing** device, creating its IOMMU mapping. |
+| `unmap_dma_buf` | Calls `dma_unmap_sgtable()` and frees the `sg_table`. |
+| `mmap` | Delegates to `dma_mmap_attrs()` — identical to the previous `neutron_buffer_fops.mmap`. |
+| `release` | Calls `neutron_buffer_put()` — identical to the previous `neutron_buffer_fops.release`. |
+| `begin_cpu_access` / `end_cpu_access` | Call `neutron_memory_sync()` for cache maintenance, consistent with `NEUTRON_IOCTL_CACHE_SYNC`. |
 
-#### Userspace Compatibility (`libNeutronDriver.so` — unchanged)
-
-| Userspace operation | Current (anon_inode) | After patch (dma_buf) | Compatible? |
-|---|---|---|---|
-| `mmap(fd)` | `neutron_buffer_fops.mmap` → `dma_mmap_attrs()` | `dma_buf_fops.mmap` → our `dma_buf_ops.mmap` → same `dma_mmap_attrs()` | **Yes** |
-| `close(fd)` | `neutron_buffer_fops.release` → `neutron_buffer_put()` | `dma_buf_fops.release` → our `dma_buf_ops.release` → same `neutron_buffer_put()` | **Yes** |
-| `ioctl(fd, ...)` | No ioctl handler on buffer fd | dma_buf framework adds `DMA_BUF_IOCTL_SYNC` automatically | **Yes** (bonus) |
-
-The buffer fd's observable behavior from userspace is identical. The library receives an fd, mmaps it, and uses the virtual pointer — this path is unchanged.
-
-#### Kernel Changes (GPL code only)
-
-**1. Implement `struct dma_buf_ops`** for the neutron buffer:
-
-- `map_dma_buf` — Returns a single-entry `sg_table` for the CMA allocation (`DMA_ATTR_FORCE_CONTIGUOUS` guarantees physical contiguity). Must call `dma_map_sgtable()` on the **importing** device (e.g., Mali GPU), not the neutron device. This is the callback that enables other devices to create their own IOMMU mappings via `dma_buf_attach()` + `dma_buf_map_attachment()`.
-- `unmap_dma_buf` — Calls `dma_unmap_sgtable()` and frees the `sg_table`.
-- `mmap` — Reuses the existing `dma_mmap_attrs()` call from `neutron_buffer_mmap()`.
-- `release` — Calls `neutron_buffer_put()` (same as current `neutron_buffer_release()`).
-- `begin_cpu_access` / `end_cpu_access` — Delegate to `neutron_memory_sync()` for cache maintenance. This ensures `DMA_BUF_IOCTL_SYNC` works correctly and is consistent with the existing `NEUTRON_IOCTL_CACHE_SYNC` path.
-
-Reference `map_dma_buf` implementation for a CMA-backed contiguous buffer:
-
-```c
-static struct sg_table *neutron_map_dma_buf(struct dma_buf_attachment *attach,
-                                            enum dma_data_direction dir)
-{
-    struct neutron_buffer *buf = attach->dmabuf->priv;
-    struct sg_table *sgt;
-    int ret;
-
-    sgt = kzalloc(sizeof(*sgt), GFP_KERNEL);
-    if (!sgt)
-        return ERR_PTR(-ENOMEM);
-    ret = sg_alloc_table(sgt, 1, GFP_KERNEL);
-    if (ret) {
-        kfree(sgt);
-        return ERR_PTR(ret);
-    }
-    sg_set_page(sgt->sgl,
-                phys_to_page(dma_to_phys(buf->ndev->dev, buf->dma_addr)),
-                buf->size, 0);
-    ret = dma_map_sgtable(attach->dev, sgt, dir, 0);
-    if (ret) {
-        sg_free_table(sgt);
-        kfree(sgt);
-        return ERR_PTR(ret);
-    }
-    return sgt;
-}
-```
-
-**2. In `neutron_buffer_create()`**, replace:
-
-```c
-/* Before */
-ret = anon_inode_getfd("neutron-buffer", &neutron_buffer_fops, buf,
-                       O_RDWR | O_CLOEXEC);
-
-/* After */
-DEFINE_DMA_BUF_EXPORT_INFO(exp_info);
-exp_info.exp_name = "neutron";    /* identifies exporter in /proc and debugfs */
-exp_info.ops = &neutron_dmabuf_ops;
-exp_info.size = size;
-exp_info.priv = buf;              /* recover via dmabuf->priv */
-exp_info.flags = O_RDWR | O_CLOEXEC;
-buf->dmabuf = dma_buf_export(&exp_info);
-if (IS_ERR(buf->dmabuf))
-    goto free_dma;
-ret = dma_buf_fd(buf->dmabuf, O_RDWR | O_CLOEXEC);
-if (ret < 0)
-    goto free_dmabuf;
-```
-
-**3. In `neutron_buffer_get_from_fd()`**, change the fd→struct recovery path:
-
-```c
-/* Before: anon_inode stores our struct in file->private_data */
-struct neutron_buffer *neutron_buffer_get_from_fd(int fd)
-{
-    struct file *file = fget(fd);
-    if (!file)
-        return ERR_PTR(-EINVAL);
-    buf = file->private_data;
-    fput(file);
-    return buf;
-}
-
-/* After: dma_buf stores our struct in dmabuf->priv.
- * CRITICAL: validate that the fd is a neutron-exported dmabuf before
- * dereferencing priv. Without this check, passing an fd from a different
- * exporter (DRM GEM, V4L2, dma_heap) causes kernel memory corruption. */
-struct neutron_buffer *neutron_buffer_get_from_fd(int fd)
-{
-    struct dma_buf *dmabuf = dma_buf_get(fd);
-    if (IS_ERR(dmabuf))
-        return ERR_PTR(-EINVAL);
-    if (dmabuf->ops != &neutron_dmabuf_ops) {
-        dma_buf_put(dmabuf);
-        return ERR_PTR(-EINVAL);
-    }
-    struct neutron_buffer *buf = dmabuf->priv;
-    dma_buf_put(dmabuf);
-    return buf;
-}
-```
-
-This function is called from 3 kernel-internal sites (all GPL code):
-
-| Call site | Purpose |
-|---|---|
-| `neutron_inference.c:469` | `NEUTRON_IOCTL_INFERENCE_CREATE` — recover buffer for inference job |
-| `neutron_device.c:561` | `NEUTRON_IOCTL_CACHE_SYNC` — recover buffer for cache maintenance |
-| `neutron_device.c:602` | `NEUTRON_IOCTL_FIRMWARE_LOAD` — recover buffer for firmware loading |
-
-All three are purely kernel-internal and invisible to userspace. No ABI change.
-
-#### What This Enables
-
-Once the buffer fd is a proper dmabuf:
-- **Mali GPU** can import it via `dma_buf_attach()` → EGLImage → GL texture/renderbuffer
-- **V4L2 / DRM / other devices** can import it via standard dmabuf sharing
-- **DMA_BUF_IOCTL_SYNC** works on the buffer fd for cache coherency (free bonus from the dma_buf framework)
-- The delegate can discover the fd via `/proc/self/fd` and expose it through the `hal_dmabuf_*` API
+`neutron_buffer_get_from_fd()` is updated to use `dma_buf_get(fd)->priv` instead of `file->private_data`, with a safety check that validates `dmabuf->ops == &neutron_dmabuf_ops` before dereferencing `priv`.
 
 ### Delivery
 
-The patch is delivered as a `.bbappend` file in the `meta-edgefirst` Yocto layer (`github.com/EdgeFirstAI/meta-edgefirst`). This keeps the NXP kernel source unmodified while layering our change on top.
+The patch lives in the `meta-edgefirst` Yocto layer and is applied as a `.bbappend` on top of the NXP `linux-imx` kernel source:
 
-### First Test: Validate fd Visibility
+**[`0001-staging-neutron-export-buffers-as-dma-buf.patch`](https://github.com/EdgeFirstAI/meta-edgefirst/blob/main/recipes-kernel/linux/files/0001-staging-neutron-export-buffers-as-dma-buf.patch)**
 
-Before any delegate work begins, the kernel patch must be deployed and the following validated on target:
+The NXP kernel source is not forked — the patch is layered on top, keeping the BSP maintainable.
 
-**Does `libNeutronDriver.so` keep the buffer fd open after mmap?** If the library calls `close(fd)` after `mmap()`, the fd disappears from `/proc/self/fd` and the entire fd discovery mechanism fails. The mmap itself survives (the kernel holds a reference), but the delegate has no way to find the fd.
+### `libNeutronDriver.so` Compatibility
 
-This is a go/no-go gate for the delegate's fd discovery approach. Test immediately after deploying the kernel patch:
+| Userspace operation | Before (anon_inode) | After (dma_buf) | Compatible? |
+|---|---|---|---|
+| `mmap(fd)` | `neutron_buffer_fops.mmap` → `dma_mmap_attrs()` | `dma_buf_ops.mmap` → same `dma_mmap_attrs()` | **Yes** |
+| `close(fd)` | `neutron_buffer_fops.release` → `neutron_buffer_put()` | `dma_buf_ops.release` → same `neutron_buffer_put()` | **Yes** |
+| `ioctl(fd, ...)` | No ioctl on buffer fd | `DMA_BUF_IOCTL_SYNC` added automatically by kernel | **Yes** (bonus) |
 
-```bash
-# Run benchmark in background, inspect its open fds
-NEUTRON_ENABLE_ZERO_COPY=1 benchmark_model \
-    --external_delegate_path=libneutron_delegate.so \
-    --graph=model.tflite --num_runs=1000 &
-PID=$!
-sleep 2
-
-# Look for neutron dmabuf fds (after kernel patch, readlink shows /dmabuf:neutron)
-ls -la /proc/$PID/fd/ | grep dmabuf
-# Or check all fds:
-for fd in /proc/$PID/fd/*; do
-    target=$(readlink $fd 2>/dev/null)
-    echo "fd=$(basename $fd) -> $target"
-done | grep -i neutron
-
-kill $PID
-```
-
-**If neutron dmabuf fds are visible**: Approach A (fd scanning) works. Proceed with delegate implementation.
-
-**If no neutron fds are found**: The library closes the fd after mmap. Fallback options:
-1. Add `NEUTRON_IOCTL_GET_BUFFER_FD` to the kernel patch — the delegate calls this ioctl on `/dev/neutron0` to retrieve the dmabuf fd for a given DMA address.
-2. Use `LD_PRELOAD` to intercept the `close()` call and preserve the fd.
-
-Option 1 is cleaner and should be included in the kernel patch preemptively — it's ~15 lines of code and eliminates the fragility of proc scanning entirely. Even if the library keeps the fd open today, a future NXP update could change that behavior.
+The proprietary library receives an fd, maps it, and uses the virtual pointer — this path is unchanged. All three `neutron_buffer_get_from_fd()` call sites (inference, cache sync, firmware load) are internal GPL code and are updated transparently.
 
 ---
 
-## Delegate Implementation
+## Delegate Implementations
 
-### fd Discovery
+### Neutron Delegate (i.MX 95)
 
-After `neutronDataSetup()` returns, the Neutron Driver has created buffer fds internally and mmap'd them. The delegate needs to discover these fds. Two approaches:
+#### fd Discovery
 
-**Approach A — `/proc/self/fd` scanning**: After the kernel patch, the buffer fds will be dma_buf fds. The delegate can scan `/proc/self/fd` for fds whose `readlink` target contains `dmabuf` and whose backing exporter is `neutron`. Match the mmap'd virtual address (from `dcfg.inputs[]`/`dcfg.outputs[]`) against the mmap regions in `/proc/self/maps` to associate fds with tensors.
+After `neutronDataSetup()` allocates buffers and `SetCustomAllocationForTensor()` registers them with TFLite, the delegate discovers the DMA-BUF fds by correlating `/proc/self/fd` with `/proc/self/maps`:
 
-**Approach B — Intercept the ioctl**: Use `LD_PRELOAD` or a thin wrapper to intercept `NEUTRON_IOCTL_BUFFER_CREATE` calls and capture the returned fd before `libNeutronDriver.so` processes it. This is more invasive but more reliable.
+```mermaid
+flowchart TD
+    Start["neutronDataSetup() + SetCustomAllocationForTensor() complete"]
+    Scan["Scan /proc/self/fd<br/>readlink → contains '/dmabuf:'"]
+    FDInfo["Read /proc/self/fdinfo/<fd><br/>confirm exp_name: neutron"]
+    Stat["fstat(fd) → inode number"]
+    Maps["Parse /proc/self/maps<br/>find mmap region with matching inode"]
+    Offset["tensor offset = tensor_vaddr - mmap_base"]
+    Store["Store tensor_index → {fd, offset, size}"]
+    Done["g_dmabuf.discovered = true<br/>hal_dmabuf_is_supported() → 1"]
 
-**Approach C — Direct ioctl replay**: The delegate knows the buffer sizes from TFLite tensor metadata. After `neutronDataSetup()`, it can directly call `NEUTRON_IOCTL_BUFFER_CREATE` to inspect the fd mapping. However, this creates additional buffers rather than discovering existing ones.
+    Start --> Scan
+    Scan --> FDInfo
+    FDInfo --> Stat
+    Stat --> Maps
+    Maps --> Offset
+    Offset --> Store
+    Store --> Done
+```
 
-**Recommended: Approach A** for Phase 1. It's non-invasive, requires no interposition, and works with the unmodified proprietary library. The `/proc/self/maps` → `/proc/self/fd` correlation is straightforward: find the mmap region containing the `dcfg.inputs[0]` virtual address, extract the fd from the mapping entry, verify it's a dma_buf via `ioctl(fd, DMA_BUF_IOCTL_SYNC, ...)` succeeding.
+The correlation is possible because the Neutron NPU uses a single contiguous DMA buffer for all tensors (inputs, outputs, weights, microcode, scratch). All activation tensors are at offsets within one mmap region. The `exp_name: neutron` field in `fdinfo` is set by `exp_info.exp_name = "neutron"` in the kernel patch, making the identification unambiguous.
 
-### New Source File: `neutron_delegate_dmabuf.cc`
+This approach is implemented in [`neutron_delegate_dmabuf.cc`](neutron_delegate_dmabuf.cc) and exposed via the `hal_dmabuf_*` symbols.
 
-Responsibilities:
-- After `Prepare()` completes with zero-copy enabled, scan for buffer fds
-- Build a tensor_index → {fd, offset, size} mapping
-- Export the `hal_dmabuf_*` C symbols from the delegate `.so`
+#### Environment Variable
 
-### Integration with Existing Zero-Copy
+DMA-BUF discovery is active when the existing zero-copy mode is enabled:
 
-The dmabuf feature builds on top of the existing zero-copy path (`NEUTRON_ENABLE_ZERO_COPY=1`):
+```sh
+NEUTRON_ENABLE_ZERO_COPY=1 ./my_application
+```
 
-1. `neutronModelPrepare()` — registers model (unchanged)
-2. `neutronDataSetup()` — allocates buffers, fills `dcfg` (unchanged)
-3. `SetCustomAllocationForTensor()` — registers with TFLite (unchanged)
-4. **NEW**: Scan `/proc/self/fd` + `/proc/self/maps` to discover buffer fds
-5. **NEW**: Build tensor → {fd, offset, size} mapping
-6. **NEW**: Export `hal_dmabuf_*` symbols
+#### Single-Buffer Topology
 
-The existing `Eval()` path is completely unchanged. The dmabuf API is read-only metadata — it tells the application where the buffers are, it doesn't change how inference runs.
+| Property | Value |
+|----------|-------|
+| Buffer count | 1 per `NeutronGraph` partition |
+| Tensor layout | All tensors at offsets within one buffer |
+| Offset | Non-zero for most tensors (packed at compile-time offsets) |
+| fd visibility | Confirmed: `libNeutronDriver.so` keeps fd open after `mmap()` |
 
 ---
 
 ## HAL DMA-BUF API
 
-### Overview
+The `hal_dmabuf_*` API is a delegate-agnostic, stable ABI contract. Each delegate ships a self-contained `hal_dmabuf.h` header — consumers do not need the full `edgefirst/hal.h`. The shared type definitions (`hal_delegate_t`, `hal_dmabuf_tensor_info`, `hal_dtype`) are also defined in `edgefirst/hal.h` for consumers already using the full HAL.
 
-The `hal_dmabuf_*` API is a delegate-agnostic interface exported from any TFLite delegate `.so` that supports DMA-BUF buffer sharing. The `edgefirst-tflite` Rust library discovers it via `dlsym` at runtime. Both the Neutron delegate and VX delegate export the same symbols.
+See also: [EdgeFirst HAL ARCHITECTURE.md — Delegate DMA-BUF Framework](https://github.com/EdgeFirstAI/hal/blob/main/ARCHITECTURE.md)
 
-The interface is formalized in the EdgeFirst HAL (`github.com/EdgeFirst/hal`) and follows existing HAL naming conventions: `hal_dmabuf_*` for functions, `HAL_DMABUF_*` for constants.
-
-### C Header
+### Type Definitions
 
 ```c
-#ifndef HAL_DMABUF_H
-#define HAL_DMABUF_H
+typedef void *hal_delegate_t;
 
-#include <stdbool.h>
-#include <stddef.h>
+typedef enum hal_dtype {
+    HAL_DTYPE_U8  = 0,  HAL_DTYPE_I8  = 1,
+    HAL_DTYPE_U16 = 2,  HAL_DTYPE_I16 = 3,
+    HAL_DTYPE_U32 = 4,  HAL_DTYPE_I32 = 5,
+    HAL_DTYPE_U64 = 6,  HAL_DTYPE_I64 = 7,
+    HAL_DTYPE_F16 = 8,  HAL_DTYPE_F32 = 9,
+    HAL_DTYPE_F64 = 10
+} hal_dtype;
 
-/* Opaque TFLite delegate pointer */
-struct TfLiteDelegate;
+#define HAL_DMABUF_MAX_NDIM 8
 
-/**
- * struct hal_dmabuf_tensor_info - DMA-BUF backing info for a tensor
- * @fd:     DMA-BUF file descriptor (-1 if not backed by dmabuf).
- *          Owned by the delegate — caller must NOT close it.
- *          Use dup() if a separately-owned fd is needed.
- *          Multiple tensors may share the same fd with different offsets.
- * @offset: Byte offset within the DMA-BUF where tensor data begins.
- *          Use with EGL_DMA_BUF_PLANE0_OFFSET_EXT for EGLImage import.
- *          Always 0 for delegates with one buffer per tensor (VX delegate).
- * @size:   Size in bytes of the tensor's region within the DMA-BUF.
- */
-struct hal_dmabuf_tensor_info {
-    int fd;
-    size_t offset;
-    size_t size;
-};
+typedef struct hal_dmabuf_tensor_info {
+    size_t size;                        /* tensor region size in bytes */
+    size_t offset;                      /* byte offset within the DMA-BUF */
+    size_t shape[HAL_DMABUF_MAX_NDIM]; /* tensor dimensions */
+    size_t ndim;                        /* number of valid shape entries */
+    int    fd;                          /* borrowed DMA-BUF fd — do NOT close */
+    hal_dtype dtype;                    /* element type */
+} hal_dmabuf_tensor_info;
 
-/**
- * hal_dmabuf_is_supported - Check if this delegate supports DMA-BUF sharing.
- * @delegate: TFLite delegate pointer.
- *
- * Returns true if the delegate has DMA-BUF buffers available.
- * This is the primary probe function — if dlsym finds this symbol AND
- * the function returns true, the full hal_dmabuf_* API is usable.
- */
-bool hal_dmabuf_is_supported(struct TfLiteDelegate *delegate);
-
-/**
- * hal_dmabuf_get_instance - Get the delegate pointer.
- *
- * Returns the TfLiteDelegate pointer for use with other hal_dmabuf_* calls.
- * Useful when the caller loaded the delegate via TFLite's external delegate
- * loader and needs the pointer for the dmabuf API.
- * Returns NULL if the delegate is not initialized.
- */
-struct TfLiteDelegate *hal_dmabuf_get_instance(void);
-
-/**
- * hal_dmabuf_get_tensor_info - Get DMA-BUF backing info for a tensor.
- * @delegate:     TFLite delegate pointer.
- * @tensor_index: TFLite tensor index.
- * @info:         Pointer to caller-allocated struct to fill.
- * @info_size:    sizeof(*info) for ABI safety. The function fills at most
- *                info_size bytes and ignores fields beyond what it knows.
- *
- * Returns 0 on success (info populated), -1 on error (sets errno):
- *   EINVAL  — delegate is NULL, info is NULL, info_size is 0, or
- *             tensor_index is out of range
- *   ENOENT  — tensor exists but is not backed by a DMA-BUF
- *   ENOTSUP — dmabuf not supported or not yet initialized
- */
-int hal_dmabuf_get_tensor_info(struct TfLiteDelegate *delegate,
-                               int tensor_index,
-                               struct hal_dmabuf_tensor_info *info,
-                               size_t info_size);
-
-/**
- * hal_dmabuf_sync_for_device - Flush CPU caches before device access.
- * @delegate:     TFLite delegate pointer.
- * @tensor_index: TFLite tensor index.
- *
- * Call after CPU writes to the buffer and before the device (NPU/GPU) reads it.
- *
- * IMPORTANT: For GPU-to-NPU pipelines, glFinish() ensures GPU writes are
- * complete but does NOT handle CPU cache coherency. If the CPU mmap is
- * cacheable (default), you must also call hal_dmabuf_sync_for_device() after
- * glFinish() and before neutronRunBlocking(). If the buffer is mapped
- * non-cacheable (e.g., DMA_ATTR_WRITE_COMBINE), glFinish() alone suffices.
- *
- * Uses NEUTRON_IOCTL_CACHE_SYNC with precise offset/size to avoid flushing
- * the entire DMA buffer. Falls back to DMA_BUF_IOCTL_SYNC if unavailable.
- *
- * Returns 0 on success, -1 on error (sets errno).
- */
-int hal_dmabuf_sync_for_device(struct TfLiteDelegate *delegate,
-                               int tensor_index);
-
-/**
- * hal_dmabuf_sync_for_cpu - Invalidate caches before CPU access.
- * @delegate:     TFLite delegate pointer.
- * @tensor_index: TFLite tensor index.
- *
- * Call before the CPU reads from a buffer that was written by a device.
- * Not needed for H2H pipelines where output goes directly to GPU/display.
- *
- * Uses NEUTRON_IOCTL_CACHE_SYNC with precise offset/size to avoid
- * invalidating the entire DMA buffer.
- *
- * Returns 0 on success, -1 on error (sets errno).
- */
-int hal_dmabuf_sync_for_cpu(struct TfLiteDelegate *delegate,
-                            int tensor_index);
-
-#endif /* HAL_DMABUF_H */
+typedef struct hal_camera_adaptor_format_info {
+    int  input_channels;
+    int  output_channels;
+    char fourcc[8];                     /* V4L2 FourCC string */
+} hal_camera_adaptor_format_info;
 ```
 
-### API Design Rationale
+> **`hal_delegate_t` vs. `TfLiteDelegate *`**: The `hal_delegate_t` is the *inner* delegate pointer, not the outer `TfLiteDelegate *` returned by `TfLiteExternalDelegateCreate()`. Always obtain it via `hal_dmabuf_get_instance()` — do not cast directly.
 
-- **Struct-based `get_tensor_info`** — Single call returns fd, offset, and size. Eliminates the ambiguous "returns 0" problem (offset=0 could mean either "first tensor" or "no dmabuf"). The caller checks the return code, not individual field values. The `info_size` parameter provides ABI stability — if the struct grows in future versions, old callers pass a smaller size and only get the fields they know about.
-- **Returns 0/-1 with errno** — Consistent with the EdgeFirst HAL's existing C API conventions and POSIX patterns. Clear error discrimination via errno.
-- **Per-tensor sync uses NEUTRON_IOCTL_CACHE_SYNC** — The kernel's `NEUTRON_IOCTL_CACHE_SYNC` accepts `{fd, offset, size}` for precise cache maintenance. This avoids the performance cost of `DMA_BUF_IOCTL_SYNC` which flushes the entire buffer (potentially tens of MB of weights/microcode when you only need to sync a 1.2 MB input tensor).
+### Function Reference
 
-### Usage Example: OpenGL Preprocessing → NPU Inference
+| Function | Signature | Return | Notes |
+|----------|-----------|--------|-------|
+| `hal_dmabuf_get_instance` | `(void)` | `hal_delegate_t` | Inner delegate handle. NULL if no delegate created. |
+| `hal_dmabuf_is_supported` | `(hal_delegate_t delegate)` | `int` 1/0 | Does NOT set errno. |
+| `hal_dmabuf_get_tensor_info` | `(delegate, tensor_index, info*, info_size)` | `int` 0/-1 | `info_size = sizeof(*info)` for ABI safety. |
+| `hal_dmabuf_sync_for_device` | `(delegate, tensor_index)` | `int` 0/-1 | Flush CPU caches before NPU reads. |
+| `hal_dmabuf_sync_for_cpu` | `(delegate, tensor_index)` | `int` 0/-1 | Invalidate CPU caches after NPU writes. |
+| `hal_camera_adaptor_is_supported` | `(delegate, format)` | `int` 1/0 | `delegate` unused (stateless query). |
+| `hal_camera_adaptor_get_format_info` | `(delegate, format, info*, info_size)` | `int` 0/-1 | Fills channel counts and FourCC. |
+
+All symbols must be exported with `__attribute__((visibility("default")))`.
+
+### Error Handling
+
+| errno | Meaning |
+|-------|---------|
+| `EINVAL` | NULL info, NULL delegate, negative tensor_index, or info_size too small |
+| `ENOTSUP` | DMA-BUF not supported by this delegate or not yet initialized |
+| `ERANGE` | tensor_index not found (out of range or not a DMA-BUF tensor) |
+| `EIO` | DMA_BUF_IOCTL_SYNC ioctl failure or internal backend error |
+
+`hal_dmabuf_is_supported()` and `hal_camera_adaptor_is_supported()` return 1/0 and do **not** set errno.
+
+The `info_size` parameter provides forward ABI compatibility. Implementations must `memset(info, 0, info_size)` before populating, so callers using an older struct size receive zeroed fields for unknown extensions.
+
+### Cache Synchronization
+
+Both sync functions wrap `DMA_BUF_IOCTL_SYNC` on the tensor's fd:
+
+| Function | ioctl flags | When to call |
+|----------|-------------|-------------|
+| `sync_for_device` | `DMA_BUF_SYNC_END \| DMA_BUF_SYNC_WRITE` | After CPU/GPU writes, before NPU reads. Call after `glFinish()`. |
+| `sync_for_cpu` | `DMA_BUF_SYNC_START \| DMA_BUF_SYNC_READ` | After NPU writes, before CPU reads. Not needed for GPU-only downstream. |
+
+> **Why `glFinish()` is not enough**: `glFinish()` guarantees GPU writes are complete in the GPU's own address space. On systems where the CPU mmap is cacheable (the default), stale CPU cache lines can shadow the GPU-written data from the NPU's perspective. `hal_dmabuf_sync_for_device()` flushes those cache lines.
+
+### Camera Adaptor API
+
+The Neutron delegate exports `hal_camera_adaptor_is_supported()` and `hal_camera_adaptor_get_format_info()` as required by the ABI contract, but both functions report no support: `is_supported` always returns `0` and `get_format_info` always returns `-1` with `errno = ENOTSUP`. The Neutron delegate has no mechanism to inject format conversion operations into the NPU graph.
+
+Camera adaptor support (NPU-injected RGBA→RGB Slice and UINT8→INT8 DataConvert operations) is available in the VX Delegate for i.MX 8M Plus. See [`github.com/EdgeFirstAI/tflite-vx-delegate-imx`](https://github.com/EdgeFirstAI/tflite-vx-delegate-imx) and its [CAMERAADAPTOR.md](https://github.com/EdgeFirstAI/tflite-vx-delegate-imx/blob/main/CAMERAADAPTOR.md).
+
+### Usage Example
 
 ```c
 /* After interpreter setup and AllocateTensors() */
-TfLiteDelegate *delegate = hal_dmabuf_get_instance();
+void *dlg_h = dlopen("libneutron_delegate.so", RTLD_LAZY);
 
-if (!hal_dmabuf_is_supported(delegate)) {
-    /* Fall back to memcpy-based preprocessing */
-}
+hal_delegate_t (*get_inst)(void)   = dlsym(dlg_h, "hal_dmabuf_get_instance");
+int (*is_sup)(hal_delegate_t)      = dlsym(dlg_h, "hal_dmabuf_is_supported");
+int (*get_info)(hal_delegate_t, int, hal_dmabuf_tensor_info *, size_t)
+                                    = dlsym(dlg_h, "hal_dmabuf_get_tensor_info");
+int (*sync_dev)(hal_delegate_t, int) = dlsym(dlg_h, "hal_dmabuf_sync_for_device");
 
-/* Get NPU input buffer as dmabuf */
-int input_idx = interpreter->inputs()[0];
-struct hal_dmabuf_tensor_info input_info;
-if (hal_dmabuf_get_tensor_info(delegate, input_idx, &input_info,
-                                sizeof(input_info)) < 0) {
-    /* Fall back to memcpy — tensor not backed by dmabuf */
-}
+hal_delegate_t delegate = get_inst();
+if (!is_sup(delegate)) { /* fall back to memcpy path */ }
 
-/* Create EGLImage from NPU input buffer */
-EGLint attrs[] = {
-    EGL_WIDTH, input_width,
-    EGL_HEIGHT, input_height,
-    EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_R8,  /* or appropriate format */
-    EGL_DMA_BUF_PLANE0_FD_EXT, input_info.fd,
-    EGL_DMA_BUF_PLANE0_OFFSET_EXT, input_info.offset,
-    EGL_DMA_BUF_PLANE0_PITCH_EXT, input_width * channels,
-    EGL_NONE
-};
-EGLImage npu_image = eglCreateImageKHR(display, EGL_NO_CONTEXT,
-                                        EGL_LINUX_DMA_BUF_EXT, NULL, attrs);
+/* Get input tensor DMA-BUF */
+int input_idx = TfLiteInterpreterGetInputTensorCount(interp) > 0 ? 0 : -1;
+hal_dmabuf_tensor_info info = {};
+if (get_info(delegate, input_idx, &info, sizeof(info)) < 0) { /* fallback */ }
 
-/* Bind as GL renderbuffer target */
-glBindRenderbuffer(GL_RENDERBUFFER, npu_rbo);
-glEGLImageTargetRenderbufferStorageOES(GL_RENDERBUFFER, npu_image);
-glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                          GL_RENDERBUFFER, npu_rbo);
+/* Import Neutron input buffer into HAL image pipeline */
+struct hal_plane_descriptor *pd = hal_plane_descriptor_new(info.fd);
+hal_plane_descriptor_set_offset(pd, info.offset);   /* non-zero for Neutron */
+struct hal_tensor *npu_input = hal_import_image(proc, pd, NULL,
+    model_w, model_h, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_I8);
 
-/* Render: sample from camera texture, write to NPU buffer */
-glUseProgram(preprocess_shader);
-glBindTexture(GL_TEXTURE_EXTERNAL_OES, camera_texture);
-glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-glFinish();  /* Ensure GPU writes are complete */
+/* Convert camera frame → NPU input (GPU zero-copy) */
+hal_image_processor_convert(proc, camera_tensor, npu_input,
+    HAL_ROTATION_NONE, HAL_FLIP_NONE, &crop);
 
-/* Sync: flush any stale CPU cache lines before NPU reads.
- * Required when CPU mmap is cacheable (default). If using non-cacheable
- * mappings (DMA_ATTR_WRITE_COMBINE), this call is a no-op. */
-hal_dmabuf_sync_for_device(delegate, input_idx);
+/* Flush caches: GPU writes visible to NPU */
+sync_dev(delegate, input_idx);
 
-/* Run inference — NPU reads directly from the buffer GPU just wrote to */
-interpreter->Invoke();
+/* Run inference */
+TfLiteInterpreterInvoke(interp);
 
-/* Access output via dmabuf (e.g., pass to display or next model) */
-int output_idx = interpreter->outputs()[0];
-struct hal_dmabuf_tensor_info output_info;
-hal_dmabuf_get_tensor_info(delegate, output_idx, &output_info,
-                           sizeof(output_info));
-/* output_info.fd and output_info.offset are ready for downstream use */
+/* Access output tensor for downstream processing */
+hal_dmabuf_tensor_info out_info = {};
+get_info(delegate, output_idx, &out_info, sizeof(out_info));
+/* out_info.fd ready for display, encoder, or next model */
+```
+
+A complete end-to-end test is in [`hal/crates/capi/tests/test_neutron_dmabuf.c`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/tests/test_neutron_dmabuf.c):
+
+```sh
+NEUTRON_ENABLE_ZERO_COPY=1 ./test_neutron_dmabuf /path/to/model.imx95.tflite
 ```
 
 ---
 
-## Compatibility
+## Integration
 
-### Mali GPU Compatibility (Confirmed)
+### NNStreamer
 
-| Property | Value |
-|----------|-------|
-| GPU | ARM Mali Valhall (`4d900000.gpu`) |
-| Driver | `mali` (ARM proprietary, `libmali.so 0.54.1`) |
-| DRM render node | `/dev/dri/renderD128` |
-| EGL dmabuf import | `EGL_EXT_image_dma_buf_import` ✓ |
-| EGL dmabuf modifiers | `EGL_EXT_image_dma_buf_import_modifiers` ✓ |
-| IOMMU | Mali has its own MMU (not behind SoC SMMU) |
-| CMA compatibility | Mali can map any CMA pages via `dma_buf_attach` + `dma_buf_map_attachment` |
+Repository: [`github.com/EdgeFirstAI/nnstreamer`](https://github.com/EdgeFirstAI/nnstreamer) (fork of [nnsuite/nnstreamer](https://github.com/nnstreamer/nnstreamer))
+Local: `../nnstreamer/ext/nnstreamer/tensor_filter/tensor_filter_tensorflow_lite.cc`
 
-### Neutron NPU Buffer Properties
+NNStreamer probes for the `hal_dmabuf_*` symbols at runtime via `dlopen`/`dlsym` after `AllocateTensors()` completes. The Neutron delegate is reached via the HAL path.
 
-| Property | Value |
-|----------|-------|
-| Allocation | `dma_alloc_attrs(dev, size, GFP_KERNEL, DMA_ATTR_FORCE_CONTIGUOUS)` |
-| Memory type | CMA (960 MB pool on imx95-evk) |
-| IOMMU | SMMU at `490d0000.iommu` (iommu group 9) |
-| Buffer topology | Single contiguous buffer, all tensors at offsets |
-| Current fd type | `anon_inode_getfd("neutron-buffer")` — NOT a dmabuf |
-| After patch | `dma_buf_export()` — proper dmabuf, importable by Mali |
+```mermaid
+flowchart TD
+    Init["AllocateTensors() complete"]
+    LoadHAL["hal_dmabuf_api_load(delegate_path, delegate)<br/>dlopen(RTLD_NOLOAD first, then RTLD_LAZY)<br/>dlsym: get_instance, is_supported, get_tensor_info, sync_*"]
+    CheckHAL{HAL symbols found<br/>and is_supported = 1?}
+    SetupHAL["setupHalDmaBuf()<br/>get_instance() → inner handle<br/>get_tensor_info(0) → fd, offset, size<br/>mmap(fd) for CPU fallback<br/>GstBufferPool from DMA-BUF fd"]
+    InferHAL["Pre-invoke: sync_for_device(delegate, input_idx)<br/>Invoke()<br/>Post-invoke: sync_for_cpu(delegate, out_idx)"]
 
-### Backward Compatibility
+    Init --> LoadHAL
+    LoadHAL --> CheckHAL
+    CheckHAL -->|Yes| SetupHAL
+    CheckHAL -->|No| Fallback["Standard copy path"]
+    SetupHAL --> InferHAL
 
-The kernel patch changes the fd type but preserves all existing behavior:
-- `libNeutronDriver.so` mmaps the fd — dma_buf fds support mmap identically
-- `NEUTRON_IOCTL_CACHE_SYNC` continues to work via the kernel driver's ioctl handler
-- `neutron_buffer_get_from_fd()` needs to use `dma_buf_get(fd)->priv` instead of `file->private_data`
-- Existing applications that don't use `hal_dmabuf_*` see no change
+    style SetupHAL fill:#e8f5e9
+    style InferHAL fill:#e8f5e9
+```
+
+The HAL path is guarded by `#ifdef HAVE_EDGEFIRST_HAL`. The `HalDmaBufAPI` struct mirrors the function pointer table:
+
+```c
+typedef struct {
+    void *(*get_instance)(void);
+    int   (*is_supported)(void *);
+    int   (*get_tensor_info)(void *, int, hal_dmabuf_tensor_info *, size_t);
+    int   (*sync_for_device)(void *, int);
+    int   (*sync_for_cpu)(void *, int);
+    gboolean available;
+} HalDmaBufAPI;
+```
+
+### tflite-rs
+
+Repository: [`github.com/EdgeFirstAI/tflite-rs`](https://github.com/EdgeFirstAI/tflite-rs)
+Local: `../tflite-rs/crates/tflite/src/dmabuf.rs`
+
+The `edgefirst_tflite` Rust crate provides a safe `DmaBuf<'a>` wrapper. It probes for HAL symbols via `dlsym` at runtime.
+
+```mermaid
+flowchart TD
+    DmaBuf["DmaBuf<'a>"]
+    HAL{hal_fns available?}
+    TI["tensor_info(idx) → TensorInfo { fd, offset, size, shape, dtype }"]
+    SFD["sync_for_device(idx)"]
+    SFC["sync_for_cpu(idx)"]
+
+    DmaBuf --> HAL
+    HAL -->|Yes| TI
+    HAL -->|Yes| SFD
+    HAL -->|Yes| SFC
+    HAL -->|No| Err["Err(TfLiteError)"]
+
+    style TI fill:#e8f5e9
+    style SFD fill:#e8f5e9
+    style SFC fill:#e8f5e9
+    style Err fill:#ffcccb
+```
+
+`is_supported()`, `tensor_info()`, `sync_for_device()`, and `sync_for_cpu()` are the primary API surface.
+
+### Python
+
+The Python bindings are exposed via `PyDmaBuf` in `tflite-rs/crates/python/src/dmabuf.rs` and accessed through the `edgefirst_tflite` Python extension:
+
+```python
+import edgefirst_tflite as ef
+
+interp = ef.Interpreter("model.imx95.tflite", delegate="libneutron_delegate.so")
+interp.allocate_tensors()
+
+dmabuf = interp.delegates[0].dmabuf()
+if dmabuf.is_supported():
+    info = dmabuf.tensor_info(0)
+    # info = {"fd": 7, "offset": 131072, "size": 3145728, "shape": [1,640,640,3], "dtype": "i8"}
+
+    # After GPU preprocessing:
+    dmabuf.sync_for_device(0)
+    interp.invoke()
+    dmabuf.sync_for_cpu(1)
+```
 
 ---
 
-## Open Questions and Risks
+## Cross-Repository Dependency Map
 
-### P0 — Must resolve before implementation
+```mermaid
+graph LR
+    subgraph "This repo"
+        ND2["tflite-neutron-delegate<br/>neutron_delegate_dmabuf.cc<br/>hal_dmabuf.h"]
+    end
+    subgraph "Kernel"
+        KP["meta-edgefirst<br/>0001-staging-neutron-export-buffers-as-dma-buf.patch"]
+    end
+    subgraph "Consumers"
+        RS["tflite-rs<br/>dmabuf.rs (Rust + Python)"]
+        NNS2["nnstreamer<br/>tensor_filter_tensorflow_lite.cc"]
+    end
+    subgraph "HAL spec"
+        HAL2["hal/ARCHITECTURE.md<br/>edgefirst/hal.h"]
+    end
 
-1. **Does `libNeutronDriver.so` close the buffer fd after mmap?** If the library calls `close(fd)` after `mmap()`, the fd disappears from `/proc/self/fd` and Approach A (fd scanning) is dead. The mmap itself survives (it holds a kernel reference), but the fd is gone. **Must verify on target** by inspecting `/proc/<pid>/fd` during inference with the unmodified delegate. If confirmed closed, fall back to Approach B (ioctl interception) or add `NEUTRON_IOCTL_GET_BUFFER_FD` to the kernel patch.
+    ND2 -- "exports hal_dmabuf_* ABI" --> RS
+    ND2 -- "exports hal_dmabuf_* ABI" --> NNS2
+    KP -- "enables fd discovery" --> ND2
+    HAL2 -- "defines ABI contract" --> ND2
 
-### P1 — Resolve during implementation
+    style ND2 fill:#e8f5e9
+    style KP fill:#fff4e1
+    style RS fill:#e1f5ff
+    style NNS2 fill:#e1f5ff
+```
 
-2. **fd discovery algorithm**: The single-buffer-per-NeutronGraph topology simplifies discovery. For the common case, there is exactly one neutron dmabuf fd per delegated partition. The algorithm: scan `/proc/self/fd`, identify neutron dmabufs by readlink target (`/dmabuf:neutron` on kernel 6.12+, requires `exp_info.exp_name = "neutron"`), correlate with `/proc/self/maps` by inode number to find the mmap base address. Tensor offset = `dcfg.inputs[i] - mmap_base`. Phase 2 improvement: add `NEUTRON_IOCTL_GET_BUFFER_FD` for a clean non-fragile path.
-
-3. **Tensor offset calculation**: The delegate knows tensor virtual addresses (from `dcfg.inputs[]`/`dcfg.outputs[]`) and the buffer's base virtual address (from the mmap region start). The offset is `tensor_vaddr - mmap_base`. This assumes all activation tensors are within one mmap — validated by the single-buffer architecture.
-
-4. **Multi-NeutronGraph models**: Models with multiple `NeutronGraph` nodes may have separate buffers per node. Each `NeutronDelegateKernel` operation has its own `dcfg`, so fd discovery should be scoped per-operation after each `neutronDataSetup()` call.
-
-5. **Cache coherency in GPU→NPU path**: The Neutron kernel driver sets `ndev->dev->dma_coherent = true` at init but toggles it to `false` around every `neutron_memory_sync()` call — the NPU is NOT hardware-coherent. The CPU mmap is cacheable by default (`dma_mmap_attrs` without `DMA_ATTR_WRITE_COMBINE`). For the GPU→NPU path, this means stale CPU cache lines could corrupt GPU-written data. Two mitigations: (a) use `DMA_BUF_IOCTL_SYNC` between GPU write and NPU read, or (b) request `DMA_ATTR_WRITE_COMBINE` for activation tensor mappings to eliminate CPU caching entirely (preferred since we don't want CPU access).
-
-6. **Whole-buffer vs. per-tensor cache sync**: `DMA_BUF_IOCTL_SYNC` operates on the entire dmabuf (potentially tens of MB). The `NEUTRON_IOCTL_CACHE_SYNC` accepts offset + size for precise scoping. The `hal_dmabuf_sync_*` implementation should prefer the latter to avoid flushing the entire buffer when only a 1.2 MB input tensor needs syncing.
-
-### P2 — Resolve during integration
-
-7. **EGLImage format mapping**: The NPU input tensor is typically quantized INT8 in NHWC layout. The EGLImage creation needs the correct `DRM_FORMAT_*` fourcc and pitch. For 3-channel INT8 (RGB), `DRM_FORMAT_BGR888` or `DRM_FORMAT_RGB888` applies. Must validate on target that Mali accepts the chosen fourcc for renderbuffer usage and that the data layout matches the NPU's expectations.
-
-8. **EGLImage non-zero offset support**: Since tensors are packed in a single buffer, input tensor EGLImages use `EGL_DMA_BUF_PLANE0_OFFSET_EXT != 0`. The `EGL_EXT_image_dma_buf_import` spec mandates offset support, but driver bugs exist in the wild. Must validate on target with Mali Valhall.
-
-9. **Kernel `devm_kzalloc` lifetime risk**: The `neutron_buffer` struct is allocated with `devm_kzalloc` (device-managed). With dma_buf export, another device (Mali) may hold a `dma_buf_attach` reference that outlives the neutron device. If the neutron device is unbound, the struct is freed but the dma_buf still references it — use-after-free. Future hardening: use `kzalloc` and manage lifetime through kref/dma_buf release.
+The VX Delegate for i.MX 8M Plus implements the same ABI and connects to the same consumers. See [`github.com/EdgeFirstAI/tflite-vx-delegate-imx`](https://github.com/EdgeFirstAI/tflite-vx-delegate-imx).
 
 ---
 
 ## References
 
-- **VX Delegate DMABUF.md**: `tflite-vx-delegate-imx/DMABUF.md` — prior art for dmabuf support in TFLite delegate
-- **Neutron kernel driver**: `linux-imx/drivers/staging/neutron/` — GPL source, target of kernel patch
-- **Neutron userspace driver**: `NeutronDriver.h` — public API (BSD-3-Clause header, proprietary binary)
-- **EdgeFirst HAL**: `github.com/EdgeFirst/hal` — HAL tensor/dmabuf abstractions
-- **EdgeFirst TFLite**: `github.com/EdgeFirst/tflite-rs` — Rust TFLite bindings with delegate probing
-- **meta-edgefirst**: `github.com/EdgeFirstAI/meta-edgefirst` — Yocto layer for kernel patches
-- **EGL dmabuf import**: `EGL_EXT_image_dma_buf_import` extension specification
+| Resource | Location |
+|----------|----------|
+| Neutron delegate implementation | `neutron_delegate_dmabuf.cc`, `hal_dmabuf.h` (this repo) |
+| VX delegate (i.MX 8M Plus) | [`github.com/EdgeFirstAI/tflite-vx-delegate-imx`](https://github.com/EdgeFirstAI/tflite-vx-delegate-imx) — `DMABUF.md` |
+| Kernel patch | [`meta-edgefirst — 0001-staging-neutron-export-buffers-as-dma-buf.patch`](https://github.com/EdgeFirstAI/meta-edgefirst/blob/main/recipes-kernel/linux/files/0001-staging-neutron-export-buffers-as-dma-buf.patch) |
+| HAL ABI specification | [`hal/ARCHITECTURE.md`](https://github.com/EdgeFirstAI/hal/blob/main/ARCHITECTURE.md) — Delegate DMA-BUF Framework section |
+| EdgeFirst HAL C header | `edgefirst/hal.h` (`hal/crates/capi/include/edgefirst/hal.h`) |
+| tflite-rs consumer | [`github.com/EdgeFirstAI/tflite-rs`](https://github.com/EdgeFirstAI/tflite-rs) — `crates/tflite/src/dmabuf.rs` |
+| NNStreamer fork | [`github.com/EdgeFirstAI/nnstreamer`](https://github.com/EdgeFirstAI/nnstreamer) — `tensor_filter_tensorflow_lite.cc` |
+| End-to-end C test | `hal/crates/capi/tests/test_neutron_dmabuf.c` |
+| Linux DMA-BUF documentation | [`Documentation/driver-api/dma-buf.rst`](https://www.kernel.org/doc/html/latest/driver-api/dma-buf.html) |
+| EGL dmabuf import extension | `EGL_EXT_image_dma_buf_import` specification |
