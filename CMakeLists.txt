@@ -19,7 +19,7 @@
 cmake_minimum_required(VERSION 3.16)
 project(tflite_neutron_delegate)
 
-set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(CMAKE_MODULE_PATH
@@ -36,20 +36,21 @@ endif()
 set(DELEGATE_SRC_DIR        ${CMAKE_CURRENT_SOURCE_DIR})
 
 if(${BUILD_FOR_LITERT})
-  set(TFLITE_GIT_REPOSITORY "https://github.com/nxp-imx/litert-imx")
-  set(TFLITE_GIT_TAG "lf-6.12.34_2.1.0")
+  set(LITERT_GIT_REPOSITORY "https://github.com/nxp-imx/litert-imx" CACHE STRING "")
+  set(LITERT_GIT_TAG "lf-6.18.20_2.0.0" CACHE STRING "")
   set(NEUTRON_DELEGATE_TARGET "litert_neutron_delegate")
   set(TFLITE_SUB_PATH "tflite")
   list(APPEND NEUTRON_DELEGATE_OPTIONS "-DBUILD_FOR_LITERT")
+  find_package(LiteRT REQUIRED)
 else()
-  set(TFLITE_GIT_REPOSITORY "https://github.com/nxp-imx/tensorflow-imx")
-  set(TFLITE_GIT_TAG "lf-6.12.34_2.1.0")
+  set(TFLITE_GIT_REPOSITORY "https://github.com/nxp-imx/tensorflow-imx" CACHE STRING "")
+  set(TFLITE_GIT_TAG "lf-6.18.20_2.0.0" CACHE STRING "")
   set(NEUTRON_DELEGATE_TARGET "neutron_delegate")
   set(TFLITE_SUB_PATH "tensorflow/lite")
+  find_package(tensorflow REQUIRED)
 endif()
-find_package(tensorflow REQUIRED)
 list(APPEND NEUTRON_DELEGATE_SRCS
-  ${tensorflow_SOURCE_DIR}/${TFLITE_SUB_PATH}/delegates/utils/simple_delegate.cc
+  ${TFLITE_SOURCE_DIR}/delegates/utils/simple_delegate.cc
   ${DELEGATE_SRC_DIR}/neutron_delegate.cc
   ${DELEGATE_SRC_DIR}/neutron_delegate_adaptor.cc
   ${DELEGATE_SRC_DIR}/neutron_delegate_dmabuf.cc
