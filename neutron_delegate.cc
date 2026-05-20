@@ -23,6 +23,7 @@
 #include <iostream>
 #include <fcntl.h>
 #include <unordered_set>
+#include <sys/file.h>
 
 
 #include "neutron_delegate.h"
@@ -41,6 +42,10 @@ extern "C" {
 }
 
 using namespace std;
+
+#define NEUTRON_RD_LOCK()   do { if (lock_fd >= 0) flock(lock_fd, LOCK_SH); } while(0)
+#define NEUTRON_WR_LOCK()   do { if (lock_fd >= 0) flock(lock_fd, LOCK_EX); } while(0)
+#define NEUTRON_UNLOCK()    do { if (lock_fd >= 0) flock(lock_fd, LOCK_UN); } while(0)
 
 namespace tflite {
 namespace neutron {
@@ -82,6 +87,7 @@ class NeutronDelegateKernel : public SimpleDelegateKernelInterface {
          << ", "
          << (enableZerocp ? "zerocp enabled." : "non-zerocp.")
          << endl;
+    lock_fd = open("/run/lock/neutron.lock", O_CREAT | O_RDWR, 0666);
     if (options.model_type == NeutronModelType_CONVERTOR) {
       return InitOfflineCompiledModel(context, params);
     } else {
@@ -199,7 +205,9 @@ class NeutronDelegateKernel : public SimpleDelegateKernelInterface {
       op.isOpPrepared = true;
       if (options.model_type !=NeutronModelType_FFIRMWARE) {
         // Prepare data for through neutron driver.
+        NEUTRON_WR_LOCK();
         auto neutronRC = neutronModelPrepare(&op.mcfg, &op.nmh);
+        NEUTRON_UNLOCK();
         TF_LITE_ENSURE_EQ(context, neutronRC, ENONE);
       } else if (options.model_type == NeutronModelType_FFIRMWARE) {
 
@@ -286,7 +294,9 @@ class NeutronDelegateKernel : public SimpleDelegateKernelInterface {
 
       if (options.model_type !=NeutronModelType_FFIRMWARE) {
         // Run neutron compute.
+        NEUTRON_RD_LOCK();
         auto neutronRC = neutronRunBlocking(delegate_op.nmh, &delegate_op.dcfg);
+        NEUTRON_UNLOCK();
         TF_LITE_ENSURE_EQ(context, neutronRC, ENONE);
       } else {
         auto neutronRC = neutronCustomExec(delegate_op.nmh, &delegate_op.dcfg);
@@ -346,6 +356,8 @@ class NeutronDelegateKernel : public SimpleDelegateKernelInterface {
 
   vector<OperationDataType> operations;
   NeutronDelegateOptions options;
+  int lock_fd = -1;
+
 };
 
 // NeutronDelegate implements the interface of SimpleDelegateInterface.
