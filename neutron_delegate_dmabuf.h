@@ -32,18 +32,27 @@ struct DmabufTensorVaddr {
     size_t size;
 };
 
-/* Set the delegate singleton pointer (call from NeutronDelegateCreate) */
-void dmabuf_set_delegate(TfLiteDelegate *delegate);
+/*
+ * Register a delegate instance in the dmabuf registry (call from
+ * NeutronDelegateCreate). Each delegate carries its own independent
+ * tensor→{fd, offset, size} mapping, so multiple interpreter contexts
+ * can coexist in one process.
+ */
+void dmabuf_register(TfLiteDelegate *delegate);
 
-/* Clear all dmabuf state (call from NeutronDelegateDelete) */
-void dmabuf_clear();
+/* Remove one delegate's dmabuf state (call from NeutronDelegateDelete).
+ * Other registered delegates are unaffected. */
+void dmabuf_unregister(TfLiteDelegate *delegate);
 
 /*
- * Discover DMA-BUF fds for the given tensor virtual addresses.
- * Call after neutronDataSetup() + SetCustomAllocationForTensor() in Prepare().
+ * Discover DMA-BUF fds for the given tensor virtual addresses of one
+ * delegate instance.
+ * Call after neutronDataSetup() + SetCustomAllocationForTensor() in Init().
  * Scans /proc/self/fd and /proc/self/maps to correlate tensor vaddrs with
- * neutron dmabuf fds. Populates the global tensor→{fd, offset, size} mapping.
+ * neutron dmabuf fds. Populates that delegate's tensor→{fd, offset, size}
+ * mapping.
  */
-void dmabuf_discover(const std::vector<DmabufTensorVaddr> &tensor_vaddrs);
+void dmabuf_discover(TfLiteDelegate *delegate,
+                     const std::vector<DmabufTensorVaddr> &tensor_vaddrs);
 
 #endif  /* NEUTRON_DELEGATE_DMABUF_H_ */

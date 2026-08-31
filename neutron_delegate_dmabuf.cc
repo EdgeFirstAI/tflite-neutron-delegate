@@ -29,6 +29,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -57,11 +58,30 @@ struct DmabufTensorEntry {
     size_t size;
 };
 
-static struct DmabufGlobal {
-    TfLiteDelegate *delegate = nullptr;
+struct DmabufInstance {
     bool discovered = false;
     unordered_map<int, DmabufTensorEntry> tensors;
-} g_dmabuf;
+};
+
+/*
+ * Registry of live delegate instances, keyed by the TfLiteDelegate the
+ * application created. Tensor indices are per-interpreter, so two
+ * contexts running the same model share indices but not buffers — the
+ * mapping must be per-delegate, never process-global. Guarded by
+ * g_dmabuf_mutex: delegates may be created, destroyed, and queried
+ * concurrently from worker threads.
+ */
+static mutex g_dmabuf_mutex;
+static unordered_map<TfLiteDelegate *, DmabufInstance> g_dmabuf_instances;
+
+/*
+ * Most recent registration, consumed by hal_dmabuf_get_instance() to
+ * pair a freshly created delegate with its HAL handle. The thread-local
+ * copy keeps concurrent per-worker delegate creation unambiguous: each
+ * worker sees the delegate it created on its own thread.
+ */
+static TfLiteDelegate *g_dmabuf_last = nullptr;
+static thread_local TfLiteDelegate *tl_dmabuf_last = nullptr;
 
 /* ── Helpers for /proc parsing ──────────────────────────────────────── */
 
@@ -194,25 +214,26 @@ static unordered_map<int, uintptr_t> find_mmap_bases(
 
 /* ── Internal API called from neutron_delegate.cc ───────────────────── */
 
-void dmabuf_set_delegate(TfLiteDelegate *delegate)
+void dmabuf_register(TfLiteDelegate *delegate)
 {
-    if (g_dmabuf.delegate != nullptr && g_dmabuf.delegate != delegate) {
-        cerr << "WARNING: dmabuf_set_delegate called with existing delegate — "
-                "previous dmabuf state cleared" << endl;
-    }
-    g_dmabuf.delegate = delegate;
-    g_dmabuf.discovered = false;
-    g_dmabuf.tensors.clear();
+    lock_guard<mutex> lock(g_dmabuf_mutex);
+    g_dmabuf_instances[delegate] = DmabufInstance();
+    g_dmabuf_last = delegate;
+    tl_dmabuf_last = delegate;
 }
 
-void dmabuf_clear()
+void dmabuf_unregister(TfLiteDelegate *delegate)
 {
-    g_dmabuf.delegate = nullptr;
-    g_dmabuf.discovered = false;
-    g_dmabuf.tensors.clear();
+    lock_guard<mutex> lock(g_dmabuf_mutex);
+    g_dmabuf_instances.erase(delegate);
+    if (g_dmabuf_last == delegate)
+        g_dmabuf_last = nullptr;
+    if (tl_dmabuf_last == delegate)
+        tl_dmabuf_last = nullptr;
 }
 
-void dmabuf_discover(const vector<DmabufTensorVaddr> &tensor_vaddrs)
+void dmabuf_discover(TfLiteDelegate *delegate,
+                     const vector<DmabufTensorVaddr> &tensor_vaddrs)
 {
     /* Phase 1: Find neutron dmabuf fds */
     vector<NeutronFdInfo> neutron_fds = find_neutron_fds();
@@ -243,18 +264,30 @@ void dmabuf_discover(const vector<DmabufTensorVaddr> &tensor_vaddrs)
             regions.push_back({info.fd, it->second, info.buf_size});
     }
 
-    /* Phase 3: Map each tensor vaddr to its containing fd region */
+    /* Phase 3: Map each tensor vaddr to its containing fd region.
+     * The /proc scan above sees every context's buffers, but vaddr
+     * containment resolves each tensor to the region its own
+     * interpreter mapped, so the result is correct per instance. */
+    lock_guard<mutex> lock(g_dmabuf_mutex);
+    auto inst_it = g_dmabuf_instances.find(delegate);
+    if (inst_it == g_dmabuf_instances.end()) {
+        cerr << "WARNING: dmabuf_discover called for unregistered delegate"
+             << endl;
+        return;
+    }
+    DmabufInstance &inst = inst_it->second;
+
     int mapped_count = 0;
     for (auto &tv : tensor_vaddrs) {
         /* First-writer-wins: skip if already mapped (shared tensors) */
-        if (g_dmabuf.tensors.find(tv.tensor_index) != g_dmabuf.tensors.end())
+        if (inst.tensors.find(tv.tensor_index) != inst.tensors.end())
             continue;
 
         for (auto &region : regions) {
             if (tv.vaddr >= region.base &&
                 tv.vaddr < region.base + region.size) {
                 size_t offset = tv.vaddr - region.base;
-                g_dmabuf.tensors[tv.tensor_index] = {
+                inst.tensors[tv.tensor_index] = {
                     region.fd, offset, tv.size};
                 mapped_count++;
                 break;
@@ -263,7 +296,7 @@ void dmabuf_discover(const vector<DmabufTensorVaddr> &tensor_vaddrs)
     }
 
     if (mapped_count > 0) {
-        g_dmabuf.discovered = true;
+        inst.discovered = true;
         cout << "INFO: dmabuf discovery mapped " << mapped_count
              << " tensors across " << regions.size() << " buffer(s)" << endl;
     }
@@ -280,40 +313,61 @@ static int dmabuf_sync(int fd, uint64_t flags)
 
 /* ── hal_dmabuf_* public API ────────────────────────────────────────── */
 
-static const DmabufTensorEntry *dmabuf_lookup(TfLiteDelegate *delegate,
-                                               int tensor_index)
+/* Copy the entry out under the lock — callers use it after unlock. */
+static bool dmabuf_lookup(TfLiteDelegate *delegate, int tensor_index,
+                          DmabufTensorEntry *out)
 {
     if (!delegate) {
         errno = EINVAL;
-        return nullptr;
+        return false;
     }
-    if (g_dmabuf.delegate != delegate || !g_dmabuf.discovered) {
+    lock_guard<mutex> lock(g_dmabuf_mutex);
+    auto inst_it = g_dmabuf_instances.find(delegate);
+    if (inst_it == g_dmabuf_instances.end() || !inst_it->second.discovered) {
         errno = ENOTSUP;
-        return nullptr;
+        return false;
     }
-    auto it = g_dmabuf.tensors.find(tensor_index);
-    if (it == g_dmabuf.tensors.end()) {
+    auto it = inst_it->second.tensors.find(tensor_index);
+    if (it == inst_it->second.tensors.end()) {
         errno = ERANGE;
-        return nullptr;
+        return false;
     }
-    return &it->second;
+    *out = it->second;
+    return true;
 }
 
 extern "C" {
 
+/*
+ * Returns the delegate most recently created on the calling thread, so
+ * a caller that creates one delegate per worker thread always pairs
+ * with its own instance. Falls back to the most recent registration
+ * process-wide, then to the sole live instance if exactly one exists.
+ */
 __attribute__((visibility("default")))
 hal_delegate_t hal_dmabuf_get_instance(void)
 {
-    return static_cast<hal_delegate_t>(g_dmabuf.delegate);
+    lock_guard<mutex> lock(g_dmabuf_mutex);
+    if (tl_dmabuf_last &&
+        g_dmabuf_instances.find(tl_dmabuf_last) != g_dmabuf_instances.end())
+        return static_cast<hal_delegate_t>(tl_dmabuf_last);
+    if (g_dmabuf_last &&
+        g_dmabuf_instances.find(g_dmabuf_last) != g_dmabuf_instances.end())
+        return static_cast<hal_delegate_t>(g_dmabuf_last);
+    if (g_dmabuf_instances.size() == 1)
+        return static_cast<hal_delegate_t>(g_dmabuf_instances.begin()->first);
+    return nullptr;
 }
 
 __attribute__((visibility("default")))
 int hal_dmabuf_is_supported(hal_delegate_t delegate)
 {
     TfLiteDelegate *d = static_cast<TfLiteDelegate *>(delegate);
-    return (g_dmabuf.delegate != nullptr &&
-            g_dmabuf.delegate == d &&
-            g_dmabuf.discovered) ? 1 : 0;
+    if (!d)
+        return 0;
+    lock_guard<mutex> lock(g_dmabuf_mutex);
+    auto it = g_dmabuf_instances.find(d);
+    return (it != g_dmabuf_instances.end() && it->second.discovered) ? 1 : 0;
 }
 
 __attribute__((visibility("default")))
@@ -327,14 +381,14 @@ int hal_dmabuf_get_tensor_info(hal_delegate_t delegate,
         return -1;
     }
     TfLiteDelegate *d = static_cast<TfLiteDelegate *>(delegate);
-    const DmabufTensorEntry *entry = dmabuf_lookup(d, tensor_index);
-    if (!entry)
+    DmabufTensorEntry entry;
+    if (!dmabuf_lookup(d, tensor_index, &entry))
         return -1;
 
     memset(info, 0, info_size);
-    info->fd = entry->fd;
-    info->offset = entry->offset;
-    info->size = entry->size;
+    info->fd = entry.fd;
+    info->offset = entry.offset;
+    info->size = entry.size;
     /* Shape/dtype not available from DmabufTensorEntry; set ndim = 0 per spec */
     info->ndim = 0;
     info->dtype = HAL_DTYPE_U8;
@@ -350,12 +404,12 @@ int hal_dmabuf_sync_for_device(hal_delegate_t delegate,
         return -1;
     }
     TfLiteDelegate *d = static_cast<TfLiteDelegate *>(delegate);
-    const DmabufTensorEntry *entry = dmabuf_lookup(d, tensor_index);
-    if (!entry)
+    DmabufTensorEntry entry;
+    if (!dmabuf_lookup(d, tensor_index, &entry))
         return -1;
 
     /* Flush CPU caches after CPU writes, before device reads */
-    return dmabuf_sync(entry->fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
+    return dmabuf_sync(entry.fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
 }
 
 __attribute__((visibility("default")))
@@ -367,12 +421,12 @@ int hal_dmabuf_sync_for_cpu(hal_delegate_t delegate,
         return -1;
     }
     TfLiteDelegate *d = static_cast<TfLiteDelegate *>(delegate);
-    const DmabufTensorEntry *entry = dmabuf_lookup(d, tensor_index);
-    if (!entry)
+    DmabufTensorEntry entry;
+    if (!dmabuf_lookup(d, tensor_index, &entry))
         return -1;
 
     /* Invalidate CPU caches before reading device-written data */
-    return dmabuf_sync(entry->fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ);
+    return dmabuf_sync(entry.fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ);
 }
 
 __attribute__((visibility("default")))
