@@ -5,14 +5,15 @@
 | Field | Value |
 |-------|-------|
 | **Author** | Sébastien Taylor <sebastien@au-zone.com> |
-| **Version** | 0.2.0 |
-| **Date** | 2026-03-27 |
+| **Version** | 0.3.0 |
+| **Date** | 2026-08-31 |
 | **Status** | Test Release |
 
 ### Changelog
 
 | Version | Date | Description |
 |---------|------|-------------|
+| 0.3.0 | 2026-08-31 | Multi-context support: per-delegate DMA-BUF registry replaces the process-global singleton; thread-safe with thread-local `hal_dmabuf_get_instance()` pairing. Kernel patch upstreamed by NXP in the 6.18.20 (wrynose) tree. |
 | 0.2.0 | 2026-03-27 | Updated to match working implementation; Mermaid diagrams; cross-references tflite-rs, nnstreamer, hal/ARCHITECTURE.md |
 | 0.1.0 | 2026-03-24 | Initial architecture and requirements |
 
@@ -187,6 +188,8 @@ The patch lives in the `meta-edgefirst` Yocto layer and is applied as a `.bbappe
 
 The NXP kernel source is not forked — the patch is layered on top, keeping the BSP maintainable.
 
+**Upstreamed by NXP**: the wrynose (lf-6.18.20) kernel tree carries the patch in-tree as commit `053be821725d` ("AIR-14567 staging: neutron: export buffers as dma-buf"), with the follow-up `464fd6f2e2de` adding `MODULE_IMPORT_NS("DMA_BUF")`. The `meta-edgefirst` bbappend therefore applies the patch only on pre-wrynose layer series; on wrynose and later the in-tree driver already exports DMA-BUF fds.
+
 ### `libNeutronDriver.so` Compatibility
 
 | Userspace operation | Before (anon_inode) | After (dma_buf) | Compatible? |
@@ -215,8 +218,8 @@ flowchart TD
     Stat["fstat(fd) → inode number"]
     Maps["Parse /proc/self/maps<br/>find mmap region with matching inode"]
     Offset["tensor offset = tensor_vaddr - mmap_base"]
-    Store["Store tensor_index → {fd, offset, size}"]
-    Done["g_dmabuf.discovered = true<br/>hal_dmabuf_is_supported() → 1"]
+    Store["Store tensor_index → {fd, offset, size}<br/>in this delegate's registry entry"]
+    Done["instance.discovered = true<br/>hal_dmabuf_is_supported(delegate) → 1"]
 
     Start --> Scan
     Scan --> FDInfo
@@ -230,6 +233,29 @@ flowchart TD
 The correlation is possible because the Neutron NPU uses a single contiguous DMA buffer for all tensors (inputs, outputs, weights, microcode, scratch). All activation tensors are at offsets within one mmap region. The `exp_name: neutron` field in `fdinfo` is set by `exp_info.exp_name = "neutron"` in the kernel patch, making the identification unambiguous.
 
 This approach is implemented in [`neutron_delegate_dmabuf.cc`](neutron_delegate_dmabuf.cc) and exposed via the `hal_dmabuf_*` symbols.
+
+#### Multiple Interpreter Contexts
+
+DMA-BUF state is kept in a mutex-guarded registry keyed by the
+`TfLiteDelegate *`, one entry per delegate instance. Tensor indices are
+per-interpreter — two contexts running the same model share indices but not
+buffers — so the mapping is never process-global. This allows an application
+to run several interpreter contexts (one delegate each, e.g. a worker pool
+for overlapped inference) in one process, with each context's
+`hal_dmabuf_*` queries resolving against its own buffers. Creating or
+destroying one delegate does not disturb the others.
+
+`hal_dmabuf_get_instance()` returns the delegate most recently created on
+the *calling thread* (falling back to the most recent process-wide, then to
+the sole live instance). A caller that creates one delegate per worker
+thread therefore always pairs with its own instance; a caller that creates
+delegates sequentially on one thread must capture the handle after each
+creation, before the next.
+
+Note that discovery scans `/proc/self/fd` and `/proc/self/maps`
+process-wide, so it observes every context's Neutron buffers — but each
+tensor virtual address falls inside exactly one mmap region, so the
+per-instance mapping stays correct.
 
 #### Environment Variable
 
@@ -294,7 +320,7 @@ typedef struct hal_camera_adaptor_format_info {
 
 | Function | Signature | Return | Notes |
 |----------|-----------|--------|-------|
-| `hal_dmabuf_get_instance` | `(void)` | `hal_delegate_t` | Inner delegate handle. NULL if no delegate created. |
+| `hal_dmabuf_get_instance` | `(void)` | `hal_delegate_t` | Inner delegate handle — most recent on the calling thread, then process-wide, then the sole live instance. NULL if no delegate is live. |
 | `hal_dmabuf_is_supported` | `(hal_delegate_t delegate)` | `int` 1/0 | Does NOT set errno. |
 | `hal_dmabuf_get_tensor_info` | `(delegate, tensor_index, info*, info_size)` | `int` 0/-1 | `info_size = sizeof(*info)` for ABI safety. |
 | `hal_dmabuf_sync_for_device` | `(delegate, tensor_index)` | `int` 0/-1 | Flush CPU caches before NPU reads. |

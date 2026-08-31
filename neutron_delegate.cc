@@ -260,7 +260,7 @@ class NeutronDelegateKernel : public SimpleDelegateKernelInterface {
                                    (uintptr_t)op.dcfg.outputs[index],
                                    (size_t)context->tensors[tensor_index].bytes});
         }
-        dmabuf_discover(tensor_vaddrs);
+        dmabuf_discover(params->delegate, tensor_vaddrs);
       }
     }
     return kTfLiteOk;
@@ -502,12 +502,12 @@ TfLiteDelegate* NeutronDelegateCreate(const NeutronDelegateOptions* options) {
           options ? *options : NeutronDelegateOptionsDefault());
   auto* raw = tflite::TfLiteDelegateFactory::CreateSimpleDelegate(move(delegate),
              kTfLiteDelegateFlagsAllowDynamicTensors);
-  dmabuf_set_delegate(raw);
+  dmabuf_register(raw);
   return raw;
 }
 
 // Destroys a delegate created with `NeutronDelegateCreate` call.
 void NeutronDelegateDelete(TfLiteDelegate* delegate) {
   tflite::TfLiteDelegateFactory::DeleteSimpleDelegate(delegate);
-  dmabuf_clear();
+  dmabuf_unregister(delegate);
 }
