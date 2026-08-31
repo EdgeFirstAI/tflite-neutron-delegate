@@ -71,6 +71,8 @@ class NeutronDelegateKernel : public SimpleDelegateKernelInterface {
 
   TfLiteStatus Init(TfLiteContext* context,
                     const TfLiteDelegateParams* params) override {
+    // Owning delegate — keys this kernel's entries in the dmabuf registry.
+    delegate_ = params->delegate;
     char *s = getenv("NEUTRON_ENABLE_ZERO_COPY");
     if (s) {
         int val = atoi(s);
@@ -260,7 +262,7 @@ class NeutronDelegateKernel : public SimpleDelegateKernelInterface {
                                    (uintptr_t)op.dcfg.outputs[index],
                                    (size_t)context->tensors[tensor_index].bytes});
         }
-        dmabuf_discover(params->delegate, tensor_vaddrs);
+        dmabuf_discover(delegate_, tensor_vaddrs);
       }
     }
     return kTfLiteOk;
@@ -343,6 +345,7 @@ class NeutronDelegateKernel : public SimpleDelegateKernelInterface {
 
   int slice_input;
   bool enableZerocp = true;
+  TfLiteDelegate* delegate_ = nullptr;
 
   vector<OperationDataType> operations;
   NeutronDelegateOptions options;
